@@ -1,0 +1,276 @@
+# -*- coding: utf-8 -*-
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFileDialog, QToolBar, QStatusBar, QMessageBox, QTableWidget,
+    QTableWidgetItem, QSpinBox, QComboBox, QLineEdit
+)
+from PySide6.QtCore import Qt, QThreadPool
+from PySide6.QtGui import QAction
+
+try:
+    from checker_ui.infra.threads import Worker
+    from checker_ui.core import tickets
+except Exception:
+    from ..infra.threads import Worker
+    from ..core import tickets
+
+
+class ExportTicketWindow(QMainWindow):
+    """
+    导出组合票（独立于数据校对）
+    步骤表字段：
+      序号 / 工序显示名 / 工位组名 / 并行能力 / 时长(秒，可逗号) /
+      区域ID(可选) / 区域容量(可选) / 起始需等区域ID(可选)
+    说明：
+      - 同一“区域ID”的一串连续步骤视为一个“阻塞区域（Zone）”，容量=同时允许几台车处于该区域。
+      - “起始需等区域ID”用于上游工位：本工位本身不占用区域名额，但开工/放行必须等待该区域出现空位。
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("导出组合票")
+        self.resize(1120, 720)
+
+        self.thread_pool = QThreadPool.globalInstance()
+        self.dst_path = None
+
+        self._build_ui()
+        self._connect_signals()
+
+    # ---------------- UI ---------------- #
+    def _build_ui(self):
+        tb = QToolBar("Ticket")
+        self.addToolBar(tb)
+
+        self.act_back = QAction("返回主页", self)
+        tb.addAction(self.act_back)
+        tb.addSeparator()
+
+        self.act_add_row = QAction("添加步骤", self)
+        self.act_del_row = QAction("删除步骤", self)
+        self.act_fill_sample = QAction("填入示例", self)
+        tb.addAction(self.act_add_row)
+        tb.addAction(self.act_del_row)
+        tb.addSeparator()
+        tb.addAction(self.act_fill_sample)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        # 参数区
+        row_top = QHBoxLayout()
+        root.addLayout(row_top)
+
+        row_top.addWidget(QLabel("工程名称："))
+        self.ed_project = QLineEdit()
+        self.ed_project.setPlaceholderText("例如：L2++")
+        self.ed_project.setFixedWidth(220)
+        row_top.addWidget(self.ed_project)
+
+        row_top.addSpacing(12)
+        row_top.addWidget(QLabel("车号数量："))
+        self.spn_cars = QSpinBox()
+        self.spn_cars.setRange(1, 9999)
+        self.spn_cars.setValue(4)
+        row_top.addWidget(self.spn_cars)
+
+        row_top.addSpacing(12)
+        row_top.addWidget(QLabel("时间格刻度："))
+        self.cmb_grid = QComboBox()
+        self.cmb_grid.addItems(["1.0", "0.5", "2.0"])
+        self.cmb_grid.setCurrentIndex(0)
+        row_top.addWidget(self.cmb_grid)
+
+        row_top.addSpacing(12)
+        row_top.addWidget(QLabel("等待分配："))
+        self.cmb_wait = QComboBox()
+        self.cmb_wait.addItems(["开始前等待", "末尾等待"])
+        self.cmb_wait.setCurrentIndex(0)
+        row_top.addWidget(self.cmb_wait)
+
+        row_top.addStretch()
+
+        # 步骤表：新增“起始需等区域ID(可选)”
+        self.tbl = QTableWidget(0, 8, self)
+        self.tbl.setHorizontalHeaderLabels([
+            "序号", "工序显示名", "工位组名", "并行能力",
+            "时长(秒，逗号分隔表示多台)", "区域ID(可选)", "区域容量(可选)",
+            "起始需等区域ID(可选)"
+        ])
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.verticalHeader().setVisible(False)
+        root.addWidget(self.tbl, 1)
+
+        # 操作区
+        row_op = QHBoxLayout()
+        root.addLayout(row_op)
+        self.btn_export = QPushButton("生成并导出组合票")
+        row_op.addWidget(self.btn_export)
+        row_op.addStretch()
+
+        self.status = QStatusBar(self)
+        self.setStatusBar(self.status)
+
+    def _connect_signals(self):
+        self.act_back.triggered.connect(self.go_home)
+        self.act_add_row.triggered.connect(self.add_row)
+        self.act_del_row.triggered.connect(self.del_row)
+        self.act_fill_sample.triggered.connect(self.fill_sample)
+        self.btn_export.clicked.connect(self.do_export)
+
+    # ------------- 动作 ------------- #
+    def add_row(self):
+        r = self.tbl.rowCount()
+        self.tbl.insertRow(r)
+        # 默认值：序号递增、能力=1、区域留空
+        self.tbl.setItem(r, 0, QTableWidgetItem(str(r + 1)))
+        self.tbl.setItem(r, 1, QTableWidgetItem(""))
+        self.tbl.setItem(r, 2, QTableWidgetItem(""))
+        self.tbl.setItem(r, 3, QTableWidgetItem("1"))
+        self.tbl.setItem(r, 4, QTableWidgetItem(""))
+        self.tbl.setItem(r, 5, QTableWidgetItem(""))   # 区域ID(可选)
+        self.tbl.setItem(r, 6, QTableWidgetItem(""))   # 区域容量(可选)
+        self.tbl.setItem(r, 7, QTableWidgetItem(""))   # 起始需等区域ID(可选)
+
+    def del_row(self):
+        r = self.tbl.currentRow()
+        if r >= 0:
+            self.tbl.removeRow(r)
+
+    def fill_sample(self):
+        """
+        串行示例 + 阻塞区域 + 上游闸门：
+        - Z1: [电检2] ~ [NDA圈内] 属于同一区域，容量=1
+        - L2++ / 电检准备：起始需等区域ID = Z1  （即：开工前要等 Z1 有空位）
+        """
+        self.tbl.setRowCount(0)
+        sample_rows = [
+            # 序号, 显示名,   组,       能力, 时长,   区域ID, 容量, 起始需等区域
+            ("1",  "L2++",   "L2++",   "1", "112", "",   "",   "Z1"),
+            ("2",  "电检准备", "电检准备", "1", "39.5", "",   "",   "Z1"),
+            ("3",  "电检1",   "电检",   "1", "80",  "",   "",   ""),   # 普通工位
+            ("4",  "电检2",   "电检",   "1", "70",  "Z1", "1", ""),   # 区域入口
+            ("5",  "电检结束", "电检结束", "1", "29.5","Z1", "",  ""),   # 区域内
+            ("6",  "NDA圈外", "NDA外",   "1", "30",  "Z1", "",  ""),   # 区域内
+            ("7",  "NDA圈内", "NDA内",   "1", "20",  "Z1", "",  ""),   # 区域出口
+            ("8",  "NDA检查", "NDA检查", "1", "30",  "",   "",   ""),   # 区域外
+        ]
+        for row in sample_rows:
+            self.add_row()
+            r = self.tbl.rowCount() - 1
+            for c, text in enumerate(row):
+                self.tbl.setItem(r, c, QTableWidgetItem(str(text)))
+
+        if not self.ed_project.text().strip():
+            self.ed_project.setText("L2++")
+        self.spn_cars.setValue(4)
+        self.cmb_grid.setCurrentText("1.0")
+        self.cmb_wait.setCurrentText("开始前等待")
+
+    def _collect_inputs(self):
+        project = self.ed_project.text().strip() or "工程"
+        cars = int(self.spn_cars.value())
+        try:
+            grid_step = float(self.cmb_grid.currentText())
+            if grid_step <= 0:
+                grid_step = 1.0
+        except Exception:
+            grid_step = 1.0
+        wait_policy = "before" if self.cmb_wait.currentIndex() == 0 else "after"
+
+        defs = []
+        for r in range(self.tbl.rowCount()):
+            seq = (self.tbl.item(r, 0).text().strip() if self.tbl.item(r, 0) else "")
+            name = (self.tbl.item(r, 1).text().strip() if self.tbl.item(r, 1) else "")
+            grp  = (self.tbl.item(r, 2).text().strip() if self.tbl.item(r, 2) else "")
+            cap  = (self.tbl.item(r, 3).text().strip() if self.tbl.item(r, 3) else "1")
+            dur  = (self.tbl.item(r, 4).text().strip() if self.tbl.item(r, 4) else "")
+            zid  = (self.tbl.item(r, 5).text().strip() if self.tbl.item(r, 5) else "")
+            zcap = (self.tbl.item(r, 6).text().strip() if self.tbl.item(r, 6) else "")
+            gzd  = (self.tbl.item(r, 7).text().strip() if self.tbl.item(r, 7) else "")
+
+            if not name or not grp or not dur:
+                continue
+
+            try:
+                capacity = max(1, int(float(cap)))
+            except Exception:
+                capacity = 1
+
+            durations = []
+            for part in dur.replace("，", ",").split(","):
+                t = part.strip()
+                if not t:
+                    continue
+                try:
+                    durations.append(float(t))
+                except Exception:
+                    pass
+            if not durations:
+                continue
+
+            rec = {
+                "seq": int(float(seq)) if seq else len(defs) + 1,
+                "display": name,
+                "group": grp,
+                "capacity": capacity,
+                "durations": durations,
+            }
+
+            if zid:
+                rec["zone_id"] = zid
+                try:
+                    rec["zone_capacity"] = max(1, int(float(zcap))) if zcap else 1
+                except Exception:
+                    rec["zone_capacity"] = 1
+
+            if gzd:
+                rec["gate_zone_id"] = gzd
+
+            defs.append(rec)
+
+        defs.sort(key=lambda x: x["seq"])
+        if not defs:
+            raise ValueError("请至少填写一行有效的步骤（工序显示名/工位组名/时长）")
+
+        return project, cars, grid_step, wait_policy, defs
+
+    def do_export(self):
+        try:
+            project, cars, grid_step, wait_policy, defs = self._collect_inputs()
+        except Exception as e:
+            QMessageBox.warning(self, "输入有误", str(e))
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "导出位置", f"{project}_组合票.xlsx", "Excel (*.xlsx)")
+        if not path:
+            return
+        self.dst_path = path
+
+        worker = Worker(
+            tickets.schedule_and_export,
+            defs, cars, grid_step, wait_policy, project, self.dst_path
+        )
+        worker.signals.error.connect(self._on_error)
+        worker.signals.finished.connect(self._on_export_finished)
+        self.thread_pool.start(worker)
+        self.status.showMessage("正在生成组合票...", 5000)
+
+    def _on_export_finished(self):
+        self.status.showMessage("导出完成", 6000)
+        QMessageBox.information(self, "完成", f"已导出：\n{self.dst_path}")
+
+    def go_home(self):
+        home = getattr(self, "home_window", None)
+        if home is not None and hasattr(home, "show"):
+            try:
+                home.show()
+            except Exception:
+                pass
+        self.close()
+
+    def _on_error(self, tb: str):
+        QMessageBox.critical(self, "出错了", tb)
+        self.status.showMessage("发生错误", 6000)
