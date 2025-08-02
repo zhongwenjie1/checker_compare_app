@@ -1,0 +1,55 @@
+name: Build Windows (PyInstaller)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'checker_ui/**'
+      - 'CheckerUI_win.spec'
+      - 'requirements.txt'
+      - '.github/workflows/build-windows.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+
+      - name: Upgrade pip/setuptools/wheel
+        run: python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install runtime deps
+        run: pip install -r requirements.txt
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build with PyInstaller (spec)
+        run: pyinstaller CheckerUI_win.spec --noconfirm
+
+      - name: List dist
+        run: dir dist /s
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CheckerUI-win
+          path: |
+            dist/**
+          if-no-files-found: error
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CheckerUI-win
+          path: |
+            dist/**
+          if-no-files-found: error
