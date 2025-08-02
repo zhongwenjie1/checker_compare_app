@@ -1,0 +1,4 @@
+pyside6>=6.6
+numpy>=1.26
+pandas>=2.2
+openpyxl>=3.1
