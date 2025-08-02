@@ -2,10 +2,11 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QToolBar, QStatusBar, QMessageBox, QTableWidget,
-    QTableWidgetItem, QSpinBox, QComboBox, QLineEdit
+    QTableWidgetItem, QSpinBox, QComboBox, QLineEdit, QColorDialog,
+    QGraphicsScene, QGraphicsView, QGraphicsRectItem, QGraphicsTextItem, QGraphicsLineItem, QSplitter, QDialog
 )
-from PySide6.QtCore import Qt, QThreadPool
-from PySide6.QtGui import QAction
+from PySide6.QtCore import Qt, QThreadPool, QPointF
+from PySide6.QtGui import QAction, QColor, QPainter, QPainterPath, QPen, QBrush
 
 try:
     from checker_ui.infra.threads import Worker
@@ -25,6 +26,8 @@ class ExportTicketWindow(QMainWindow):
       - 同一“区域ID”的一串连续步骤视为一个“阻塞区域（Zone）”，容量=同时允许几台车处于该区域。
       - “起始需等区域ID”用于上游工位：本工位本身不占用区域名额，但开工/放行必须等待该区域出现空位。
     """
+    COL_COLOR = 8
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("导出组合票")
@@ -43,6 +46,14 @@ class ExportTicketWindow(QMainWindow):
 
         self.act_back = QAction("返回主页", self)
         tb.addAction(self.act_back)
+        tb.addSeparator()
+
+        self.act_help = QAction("帮助", self)
+        tb.addAction(self.act_help)
+        tb.addSeparator()
+
+        self.act_diagram = QAction("流程图", self)
+        tb.addAction(self.act_diagram)
         tb.addSeparator()
 
         self.act_add_row = QAction("添加步骤", self)
@@ -92,25 +103,28 @@ class ExportTicketWindow(QMainWindow):
 
         row_top.addStretch()
 
-        # 步骤表：新增“起始需等区域ID(可选)”
-        self.tbl = QTableWidget(0, 8, self)
+        # 步骤表：新增“起始需等区域ID(可选)”和“填充颜色(可选)”
+        self.tbl = QTableWidget(0, 9, self)
         self.tbl.setHorizontalHeaderLabels([
             "序号", "工序显示名", "工位组名", "并行能力",
             "时长(秒，逗号分隔表示多台)", "区域ID(可选)", "区域容量(可选)",
-            "起始需等区域ID(可选)"
+            "起始需等区域ID(可选)", "填充颜色(可选)"
         ])
         self.tbl.horizontalHeader().setStretchLastSection(True)
         self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setColumnWidth(self.COL_COLOR, 40)
+
         root.addWidget(self.tbl, 1)
 
-        # 操作区
-        row_op = QHBoxLayout()
-        root.addLayout(row_op)
+        # 底部导出按钮栏
+        btn_bar = QHBoxLayout()
+        root.addLayout(btn_bar)
+        btn_bar.addStretch()
         self.btn_export = QPushButton("生成并导出组合票")
-        row_op.addWidget(self.btn_export)
-        row_op.addStretch()
+        btn_bar.addWidget(self.btn_export)
 
-        self.status = QStatusBar(self)
+        # 状态栏（用于显示导出进度 / 完成信息）
+        self.status = QStatusBar()
         self.setStatusBar(self.status)
 
     def _connect_signals(self):
@@ -119,6 +133,8 @@ class ExportTicketWindow(QMainWindow):
         self.act_del_row.triggered.connect(self.del_row)
         self.act_fill_sample.triggered.connect(self.fill_sample)
         self.btn_export.clicked.connect(self.do_export)
+        self.act_help.triggered.connect(self.show_help)
+        self.act_diagram.triggered.connect(self.show_diagram)
 
     # ------------- 动作 ------------- #
     def add_row(self):
@@ -134,10 +150,30 @@ class ExportTicketWindow(QMainWindow):
         self.tbl.setItem(r, 6, QTableWidgetItem(""))   # 区域容量(可选)
         self.tbl.setItem(r, 7, QTableWidgetItem(""))   # 起始需等区域ID(可选)
 
+        color_btn = QPushButton("…")
+        color_btn.setFixedSize(30, 22)
+        color_btn.clicked.connect(lambda _, row=r: self._choose_color(row))
+        self.tbl.setCellWidget(r, self.COL_COLOR, color_btn)
+        color_item = QTableWidgetItem("")
+        color_item.setData(Qt.UserRole, "")
+        self.tbl.setItem(r, self.COL_COLOR, color_item)
+
+        # self.refresh_diagram()
+
+    def _choose_color(self, row: int):
+        dlg_col = QColorDialog.getColor(parent=self)
+        if dlg_col.isValid():
+            hex_code = dlg_col.name()
+            btn = self.tbl.cellWidget(row, self.COL_COLOR)
+            btn.setStyleSheet(f"background:{hex_code};")
+            self.tbl.item(row, self.COL_COLOR).setData(Qt.UserRole, hex_code)
+        # self.refresh_diagram()
+
     def del_row(self):
         r = self.tbl.currentRow()
         if r >= 0:
             self.tbl.removeRow(r)
+        # self.refresh_diagram()
 
     def fill_sample(self):
         """
@@ -168,6 +204,7 @@ class ExportTicketWindow(QMainWindow):
         self.spn_cars.setValue(4)
         self.cmb_grid.setCurrentText("1.0")
         self.cmb_wait.setCurrentText("开始前等待")
+        # self.refresh_diagram()
 
     def _collect_inputs(self):
         project = self.ed_project.text().strip() or "工程"
@@ -190,6 +227,7 @@ class ExportTicketWindow(QMainWindow):
             zid  = (self.tbl.item(r, 5).text().strip() if self.tbl.item(r, 5) else "")
             zcap = (self.tbl.item(r, 6).text().strip() if self.tbl.item(r, 6) else "")
             gzd  = (self.tbl.item(r, 7).text().strip() if self.tbl.item(r, 7) else "")
+            color_hex = self.tbl.item(r, self.COL_COLOR).data(Qt.UserRole) or ""
 
             if not name or not grp or not dur:
                 continue
@@ -217,6 +255,7 @@ class ExportTicketWindow(QMainWindow):
                 "group": grp,
                 "capacity": capacity,
                 "durations": durations,
+                "color": color_hex,
             }
 
             if zid:
@@ -270,6 +309,118 @@ class ExportTicketWindow(QMainWindow):
             except Exception:
                 pass
         self.close()
+
+    # ---------- 帮助弹窗 ----------
+    def show_help(self):
+        msg = (
+            "<h3>组合票操作指南</h3>"
+            "<ol>"
+            "<li>点击『添加步骤』逐行录入；列含 ‘区域ID/容量’ 与 ‘起始需等区域ID’</li>"
+            "<li>同一阻塞段填写同一区域ID，并仅在段首行写容量</li>"
+            "<li>若需闸门等待，在 ‘起始需等区域ID’ 填下游区名</li>"
+            "<li>最后一列『…』可自选颜色；未选自动配色</li>"
+            "<li>顶部参数：车号数量 / 时间格刻度 / 等待分配方式</li>"
+            "<li>填写完点击『生成并导出组合票』即可生成 Excel</li>"
+            "</ol>"
+        )
+        QMessageBox.information(self, "帮助", msg)
+
+    # ---------- 流程图弹窗 ----------
+    def show_diagram(self):
+        """弹出彩色流程图对话框"""
+        steps = []
+        for r in range(self.tbl.rowCount()):
+            name = (self.tbl.item(r, 1).text().strip() if self.tbl.item(r, 1) else "")
+            zone = (self.tbl.item(r, 5).text().strip() if self.tbl.item(r, 5) else "")
+            gate = (self.tbl.item(r, 7).text().strip() if self.tbl.item(r, 7) else "")
+            color = self.tbl.item(r, self.COL_COLOR).data(Qt.UserRole) or "#b0bec5"
+            if name:
+                steps.append({"row": r, "name": name, "zone": zone, "gate": gate, "color": color})
+        if not steps:
+            QMessageBox.information(self, "提示", "请先录入步骤")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("流程示意")
+        dlg.resize(900, 260)
+        lay = QVBoxLayout(dlg)
+
+        view = QGraphicsView()
+        view.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+        lay.addWidget(view)
+
+        scene = QGraphicsScene(view)
+        self._draw_blocks(scene, steps)
+        view.setScene(scene)
+        view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
+
+        dlg.exec()
+
+    # ---------- 串联示意图 ---------- #
+    def _draw_blocks(self, scene: QGraphicsScene, steps):
+        x, y = 0.0, 0.0
+        h, w, gap = 32, 110, 22
+        pen = QPen(Qt.black, 1)
+        zone_cache = {}
+        for idx, s in enumerate(steps):
+            # 决定颜色：自选 > 同区
+            col = s["color"] if s["color"] else zone_cache.get(s["zone"], "#90a4ae")
+            if s["zone"] and s["zone"] not in zone_cache:
+                zone_cache[s["zone"]] = col
+            rect = QGraphicsRectItem(x, y, w, h)
+            rect.setBrush(QBrush(QColor(col)))
+            rect.setPen(pen)
+            rect.setData(0, s["row"])
+            rect.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
+            scene.addItem(rect)
+
+            txt = QGraphicsTextItem(s["name"])
+            txt.setDefaultTextColor(Qt.black)
+            txt.setPos(x + 4, y + 4)
+            scene.addItem(txt)
+
+            if s["gate"]:
+                gate_txt = QGraphicsTextItem("⛔")
+                gate_txt.setDefaultTextColor(Qt.red)
+                gate_txt.setPos(x - 14, y + 4)
+                scene.addItem(gate_txt)
+
+            if idx < len(steps) - 1:
+                line = QGraphicsLineItem(x + w, y + h / 2, x + w + gap, y + h / 2)
+                line.setPen(pen)
+                scene.addItem(line)
+                # 箭头
+                path = QPainterPath()
+                path.moveTo(QPointF(x + w + gap, y + h / 2))
+                path.lineTo(QPointF(x + w + gap - 6, y + h / 2 - 4))
+                path.lineTo(QPointF(x + w + gap - 6, y + h / 2 + 4))
+                path.closeSubpath()
+                scene.addPath(path, pen, QBrush(Qt.black))
+
+            # 点击彩块自动选中行
+            def make_cb(row_idx):
+                return lambda _: self.tbl.selectRow(row_idx)
+            rect.mousePressEvent = make_cb(s["row"])
+
+            x += w + gap
+
+    # def refresh_diagram(self):
+    #     """根据表格内容重绘右侧流程示意"""
+    #     steps = []
+    #     for r in range(self.tbl.rowCount()):
+    #         name_item = self.tbl.item(r, 1)
+    #         zone_item = self.tbl.item(r, 5)
+    #         gate_item = self.tbl.item(r, 7)
+    #         name = name_item.text().strip() if name_item else ""
+    #         zone = zone_item.text().strip() if zone_item else ""
+    #         gate = gate_item.text().strip() if gate_item else ""
+    #         color_hex = self.tbl.item(r, self.COL_COLOR).data(Qt.UserRole) or "#b0bec5"
+    #         if name:
+    #             steps.append({"row": r, "name": name, "zone": zone, "gate": gate, "color": color_hex})
+    #     scene = QGraphicsScene(self.view)
+    #     self._draw_blocks(scene, steps)
+    #     self.view.setScene(scene)
+    #     self.view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
 
     def _on_error(self, tb: str):
         QMessageBox.critical(self, "出错了", tb)

@@ -329,6 +329,7 @@ class MainWindow(QMainWindow):
                     pass
         self.close()
 
+
     def _on_error(self, tb: str):
         QMessageBox.critical(self, "出错了", tb)
         self.status.showMessage("发生错误", 5000)

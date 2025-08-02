@@ -276,12 +276,14 @@ def schedule_and_export(defs: List[Dict[str, Any]],
                         dst_path: str) -> None:
     grid_step = 1.0 if (not isinstance(grid_step, (int, float)) or grid_step <= 0) else float(grid_step)
     rows, max_finish = schedule(defs, cars)
+    # ---- 收集用户自定义颜色 (display -> hex)
+    step_color_map = {d.get("display"): d.get("color") for d in defs if d.get("color")}
     engine = _choose_engine()
     if engine is None:
         raise RuntimeError("未找到可用的 Excel 引擎，请安装 xlsxwriter 或 openpyxl")
 
     if engine == "xlsxwriter":
-        _export_with_xlsxwriter(rows, max_finish, grid_step, wait_policy, project, dst_path)
+        _export_with_xlsxwriter(rows, max_finish, grid_step, wait_policy, project, dst_path, step_color_map)
     else:
         _export_with_openpyxl(rows, max_finish, grid_step, wait_policy, project, dst_path)
 
@@ -305,7 +307,8 @@ def _fmt_num(x: float) -> str:
 # ---------------- xlsxwriter 彩色导出 ---------------- #
 def _export_with_xlsxwriter(rows: List[Dict[str, Any]], max_finish: float,
                              grid_step: float, wait_policy: str,
-                             project: str, dst_path: str) -> None:
+                             project: str, dst_path: str,
+                             step_color_map: Dict[str, str]) -> None:
     import xlsxwriter  # type: ignore
 
     by_car = _build_car_slices(rows)
@@ -328,7 +331,14 @@ def _export_with_xlsxwriter(rows: List[Dict[str, Any]], max_finish: float,
 
         group_colors, _ = _palette()
         group_fmt_cache: Dict[str, Any] = {}
-        def bar_fmt(group: str):
+        def bar_fmt(group: str, display: str):
+            # 若当前步骤有自定义颜色，优先使用
+            custom_hex = step_color_map.get(display)
+            if custom_hex:
+                if custom_hex not in group_fmt_cache:
+                    group_fmt_cache[custom_hex] = wb.add_format({"bg_color": custom_hex, "border": 0})
+                return group_fmt_cache[custom_hex]
+            # 否则按 group 调色盘
             if group not in group_fmt_cache:
                 idx = (hash(group) >> 1) % len(group_colors)
                 group_fmt_cache[group] = wb.add_format({"bg_color": group_colors[idx], "border": 0})
@@ -379,7 +389,7 @@ def _export_with_xlsxwriter(rows: List[Dict[str, Any]], max_finish: float,
                 c_start = 4 + int(math.floor(s["start"] / grid_step))
                 c_end_svc = 4 + int(math.ceil(s["svc_finish"] / grid_step)) - 1
                 c_end_svc = max(c_end_svc, c_start)
-                bf = bar_fmt(s["group"])
+                bf = bar_fmt(s["group"], s["step_display"])
                 for c in range(c_start, c_end_svc + 1):
                     ws.write(row_cursor, c, "", bf)
                 row_cursor += 1
@@ -435,6 +445,7 @@ def _export_with_openpyxl(rows: List[Dict[str, Any]], max_finish: float,
         out_rows.append({"车号": "", "项目": "", "时间": "", "说明": ""})
 
     df = pd.DataFrame(out_rows, columns=["车号", "项目", "时间", "说明"])
+    # TODO: 未应用自定义颜色（step_color_map）到 openpyxl 导出
     with pd.ExcelWriter(dst_path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="作业组合票")
         try:
