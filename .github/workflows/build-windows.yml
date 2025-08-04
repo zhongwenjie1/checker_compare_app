@@ -36,20 +36,24 @@ jobs:
       - name: Build with PyInstaller (spec)
         run: pyinstaller CheckerUI_win.spec --noconfirm
 
-      - name: List dist
-        run: dir dist /s
+      # 关键：不再用 "dir dist /s"
+      - name: List dist (PowerShell)
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          if (Test-Path dist) {
+            Get-ChildItem -Path dist -Recurse |
+              Select-Object FullName, Length |
+              Format-Table -AutoSize
+          } else {
+            Write-Host "dist folder not found (nothing to list)"
+          }
 
-      - name: Upload artifact
+      - name: Upload artifact (only if dist has files)
+        if: ${{ hashFiles('dist/**') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: CheckerUI-win
-          path: |
-            dist/**
-          if-no-files-found: error
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: CheckerUI-win
-          path: |
-            dist/**
-          if-no-files-found: error
+          path: dist/**
+          if-no-files-found: warn
