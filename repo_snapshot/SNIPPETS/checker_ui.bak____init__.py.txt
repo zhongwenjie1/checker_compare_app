@@ -1,0 +1,12 @@
+# checker_ui.bak/__init__.py
+
+## Classes & Methods
+{
+  "classes": [],
+  "functions": []
+}
+
+## Head Snippet
+```
+
+```

@@ -1,0 +1,350 @@
+# checker_ui/ui/export_ticket_window.py
+
+## Classes & Methods
+{
+  "classes": [
+    {
+      "name": "_ExportAreaPanel",
+      "methods": [
+        "__init__",
+        "rebuild_zones",
+        "_sync_cycle_from_table",
+        "_apply_cycle_to_zone",
+        "on_table_changed"
+      ]
+    },
+    {
+      "name": "StationPropertiesDialog",
+      "methods": [
+        "__init__",
+        "_choose_color",
+        "_add_row",
+        "_del_row",
+        "payload",
+        "_preview"
+      ]
+    },
+    {
+      "name": "ExportTicketWindow",
+      "methods": [
+        "__init__",
+        "_build_ui",
+        "_connect_signals",
+        "_show_table_menu",
+        "add_row",
+        "_choose_color",
+        "_prepare_color_cell",
+        "_open_add_workstation",
+        "_insert_workstation_rows",
+        "_header_text",
+        "_col",
+        "_set_cell",
+        "_get_cell_text",
+        "_renumber_seq",
+        "del_row",
+        "fill_sample",
+        "_collect_inputs",
+        "do_export",
+        "_on_export_finished",
+        "go_home",
+        "show_help",
+        "show_diagram",
+        "_collect_defs_for_flow",
+        "_open_properties_for_group",
+        "_draw_blocks",
+        "refresh_diagram",
+        "_on_error",
+        "_open_edit_properties",
+        "_collect_station_payload_at"
+      ]
+    }
+  ],
+  "functions": []
+}
+
+## Head Snippet
+```
+# -*- coding: utf-8 -*-
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFileDialog, QToolBar, QStatusBar, QMessageBox, QTableWidget,
+    QTableWidgetItem, QSpinBox, QComboBox, QLineEdit, QColorDialog,
+    QGraphicsScene, QGraphicsView, QGraphicsRectItem, QGraphicsTextItem, QGraphicsLineItem, QSplitter, QDialog,
+    QDockWidget, QFormLayout, QDoubleSpinBox, QDialogButtonBox, QMenu, QAbstractItemView
+)
+from PySide6.QtCore import Qt, QThreadPool, QPointF
+
+from PySide6.QtGui import QAction, QColor, QPainter, QPainterPath, QPen, QBrush
+
+# 功能开关：是否显示右侧“区域面板”
+FEATURE_SHOW_AREA_PANEL = False
+
+
+try:
+    from checker_ui.infra.threads import Worker
+    from checker_ui.core import tickets
+except Exception:
+    from ..infra.threads import Worker
+    from ..core import tickets
+
+
+try:
+    from checker_ui.ui.workstation_dialog import WorkstationDialog
+except Exception:
+    from ..ui.workstation_dialog import WorkstationDialog
+
+# FlowView fallback import
+try:
+    from checker_ui.ui.flow_view import FlowView
+except Exception:
+    from ..ui.flow_view import FlowView
+
+
+# 区域面板（仅用于本窗口表格）
+class _ExportAreaPanel(QWidget):
+    """右侧区域面板（仅作用于本窗口的表格）。
+    - 列出当前表格中出现的所有 区域ID；
+    - 为选中区域批量设置“节拍时间(秒)”（会写入该区域所有行的第6列）。
+    """
+    def __init__(self, host_window: 'ExportTicketWindow'):
+        super().__init__(host_window)
+        self.host = host_window
+        self._programmatic = False  # 防止 itemChanged 的循环触发
+
+        lay = QFormLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        self.cmb_zone = QComboBox(self)
+        lay.addRow("区域ID：", self.cmb_zone)
+
+        self.spn_cycle = QDoubleSpinBox(self)
+        self.spn_cycle.setRange(0.0, 99999.0)
+        self.spn_cycle.setDecimals(1)
+        self.spn_cycle.setSingleStep(0.5)
+        self.spn_cycle.setValue(0.0)
+        lay.addRow("节拍时间(秒)：", self.spn_cycle)
+
+        self.btn_apply = QPushButton("应用节拍到该区域", self)
+        lay.addRow("", self.btn_apply)
+
+        self.cmb_zone.currentTextChanged.connect(self._sync_cycle_from_table)
+        self.btn_apply.clicked.connect(self._apply_cycle_to_zone)
+
+    def rebuild_zones(self):
+        zones = []
+        seen = set()
+        tbl = self.host.tbl
+        for r in range(tbl.rowCount()):
+            item = tbl.item(r, 6)  # 区域ID列
+            zid = item.text().strip() if item else ""
+            if zid and zid not in seen:
+                seen.add(zid)
+                zones.append(zid)
+        self._programmatic = True
+        try:
+            self.cmb_zone.clear()
+            self.cmb_zone.addItems(zones)
+        finally:
+            self._programmatic = False
+        # 选区后同步一次节拍显示
+        if zones:
+            self._sync_cycle_from_table(zones[0])
+        else:
+            self.spn_cycle.setValue(0.0)
+
+    def _sync_cycle_from_table(self, zid: str):
+        if self._programmatic:
+            return
+        if not zid:
+            self.spn_cycle.setValue(0.0)
+            return
+        # 读取该区域在表中的最大节拍（为空按0）
+        tbl = self.host.tbl
+        max_ct = 0.0
+        for r in range(tbl.rowCount()):
+            zitem = tbl.item(r, 6)
+            if not zitem:
+                continue
+            if (zitem.text().strip() == zid):
+                ct_item = tbl.item(r, 5)
+                if ct_item:
+                    try:
+                        v = float(ct_item.text().strip())
+                        if v > max_ct:
+                            max_ct = v
+                    except Exception:
+                        pass
+        self.spn_cycle.setValue(max_ct)
+
+    def _apply_cycle_to_zone(self):
+        zid = self.cmb_zone.currentText().strip()
+        if not zid:
+            return
+        val = float(self.spn_cycle.value())
+        tbl = self.host.tbl
+        self._programmatic = True
+        try:
+            tbl.blockSignals(True)
+            for r in range(tbl.rowCount()):
+                zitem = tbl.item(r, 6)
+                if not zitem:
+                    continue
+                if zitem.text().strip() == zid:
+                    # 写入第6列：节拍时间(秒，可选)
+                    item = tbl.item(r, 5)
+                    if item is None:
+                        item = QTableWidgetItem("")
+                        tbl.setItem(r, 5, item)
+                    # 统一保留1位小数（与导出网格0.5/1.0常见设置匹配）
+                    item.setText(f"{val:.1f}" if abs(val - round(val)) > 1e-9 else str(int(round(val))))
+        finally:
+            tbl.blockSignals(False)
+            self._programmatic = False
+        # 应用后保持列表同步
+        self._sync_cycle_from_table(zid)
+
+    # 供表格变动时调用
+    def on_table_changed(self, *_):
+        if not self._programmatic:
+            self.rebuild_zones()
+
+
+# ========== 岗位属性对话框（编辑 & 预览） ==========
+class StationPropertiesDialog(QDialog):
+    """
+    输入/输出 payload 结构兼容 _insert_workstation_rows：
+      {
+        station_id, station_display, zone_id, color, cycle_time, zone_capacity,
+        steps: [{name, duration}, ...],
+        gate: {zone_id}
+      }
+    """
+    def __init__(self, parent, initial: dict):
+        super().__init__(parent)
+        self.setWindowTitle("岗位属性")
+        self.resize(680, 520)
+        self._color_hex = initial.get("color") or ""
+
+        lay = QVBoxLayout(self)
+
+        # 顶部：基础属性
+        row = QHBoxLayout(); lay.addLayout(row)
+        row.addWidget(QLabel("工位组名："))
+        self.ed_station = QLineEdit(initial.get("station_id", "")); self.ed_station.setReadOnly(True); self.ed_station.setFixedWidth(150); row.addWidget(self.ed_station)
+        row.addSpacing(10); row.addWidget(QLabel("显示名："))
+        self.ed_display = QLineEdit(initial.get("station_display", "") or initial.get("station_id", "")); self.ed_display.setFixedWidth(180); row.addWidget(self.ed_display)
+        row.addSpacing(10); row.addWidget(QLabel("区域ID："))
+        self.ed_zone = QLineEdit(initial.get("zone_id", "")); self.ed_zone.setFixedWidth(120); row.addWidget(self.ed_zone)
+
+        row2 = QHBoxLayout(); lay.addLayout(row2)
+        row2.addWidget(QLabel("节拍(秒)："))
+        self.spn_cycle = QDoubleSpinBox(); self.spn_cycle.setRange(0, 99999); self.spn_cycle.setDecimals(1); self.spn_cycle.setSingleStep(0.5)
+        self.spn_cycle.setValue(float(initial.get("cycle_time") or 0)); self.spn_cycle.setFixedWidth(120); row2.addWidget(self.spn_cycle)
+
+        row2.addSpacing(10); row2.addWidget(QLabel("区域容量："))
+        self.spn_cap = QSpinBox(); self.spn_cap.setRange(1, 99); self.spn_cap.setValue(int(initial.get("zone_capacity") or 1)); self.spn_cap.setFixedWidth(120); row2.addWidget(self.spn_cap)
+
+        row2.addSpacing(10); row2.addWidget(QLabel("起始需等区域ID："))
+        self.ed_gate = QLineEdit((initial.get("gate") or {}).get("zone_id", "")); self.ed_gate.setFixedWidth(140); row2.addWidget(self.ed_gate)
+
+        row2.addSpacing(10)
+        self.btn_color = QPushButton("颜色…")
+        if self._color_hex: self.btn_color.setStyleSheet(f"background:{self._color_hex};")
+        self.btn_color.clicked.connect(self._choose_color); row2.addWidget(self.btn_color)
+        row2.addStretch()
+
+        # 中部：步骤表
+        lay.addWidget(QLabel("步骤清单（名称 / 时长秒）"))
+        self.tbl = QTableWidget(0, 2, self)
+        self.tbl.setHorizontalHeaderLabels(["步骤名", "时长(秒)"])
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self.tbl, 1)
+
+        for st in (initial.get("steps") or []):
+            r = self.tbl.rowCount()
+            self.tbl.insertRow(r)
+            self.tbl.setItem(r, 0, QTableWidgetItem(str(st.get("name", ""))))
+            self.tbl.setItem(r, 1, QTableWidgetItem(str(st.get("duration", ""))))
+
+        # 步骤按钮
+        row3 = QHBoxLayout(); lay.addLayout(row3)
+        self.btn_add = QPushButton("添加步骤"); self.btn_del = QPushButton("删除步骤"); self.btn_preview = QPushButton("预览")
+        row3.addWidget(self.btn_add); row3.addWidget(self.btn_del); row3.addStretch(); row3.addWidget(self.btn_preview)
+        self.btn_add.clicked.connect(self._add_row)
+        self.btn_del.clicked.connect(self._del_row)
+        self.btn_preview.clicked.connect(self._preview)
+
+        # 按钮组
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _choose_color(self):
+        col = QColorDialog.getColor(parent=self)
+        if col.isValid():
+            self._color_hex = col.name()
+            self.btn_color.setStyleSheet(f"background:{self._color_hex};")
+
+    def _add_row(self):
+        r = self.tbl.rowCount()
+        self.tbl.insertRow(r)
+        self.tbl.setItem(r, 0, QTableWidgetItem(""))
+        self.tbl.setItem(r, 1, QTableWidgetItem("0"))
+
+    def _del_row(self):
+        r = self.tbl.currentRow()
+        if r >= 0:
+            self.tbl.removeRow(r)
+
+    def payload(self) -> dict:
+        steps = []
+        for r in range(self.tbl.rowCount()):
+            name = self.tbl.item(r, 0).text().strip() if self.tbl.item(r, 0) else ""
+            dur_txt = self.tbl.item(r, 1).text().strip() if self.tbl.item(r, 1) else "0"
+            try: dur = float(dur_txt)
+            except Exception: dur = 0.0
+            steps.append({"name": name, "duration": dur})
+        return {
+            "station_id": self.ed_station.text().strip(),
+            "station_display": self.ed_display.text().strip() or self.ed_station.text().strip(),
+            "zone_id": self.ed_zone.text().strip(),
+            "color": self._color_hex,
+            "cycle_time": float(self.spn_cycle.value()),
+            "zone_capacity": int(self.spn_cap.value()),
+            "steps": steps,
+            "gate": {"zone_id": self.ed_gate.text().strip()} if self.ed_gate.text().strip() else {},
+        }
+
+    def _preview(self):
+        steps = self.payload().get("steps") or []
+        if not steps:
+            QMessageBox.information(self, "预览", "请先添加步骤"); return
+        dlg = QDialog(self); dlg.setWindowTitle("预览"); dlg.resize(780, 240)
+        v = QVBoxLayout(dlg)
+        view = QGraphicsView(); view.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+        v.addWidget(view)
+        scene = QGraphicsScene(view)
+        x, y, w, h, gap = 0, 0, 110, 32, 22
+        pen = QPen(Qt.black, 1)
+        color = self._color_hex or "#90a4ae"
+        for i, st in enumerate(steps):
+            rect = QGraphicsRectItem(x, y, w, h); rect.setBrush(QBrush(QColor(color))); rect.setPen(pen); scene.addItem(rect)
+            txt = QGraphicsTextItem(st.get("name") or ("(显示名)" if i == 0 else "")); txt.setDefaultTextColor(Qt.black); txt.setPos(x + 4, y + 4); scene.addItem(txt)
+            if i < len(steps) - 1:
+                line = QGraphicsLineItem(x + w, y + h/2, x + w + gap, y + h/2); line.setPen(pen); scene.addItem(line)
+                arrow = QPainterPath(); arrow.moveTo(QPointF(x + w + gap, y + h/2))
+                arrow.lineTo(QPointF(x + w + gap - 6, y + h/2 - 4)); arrow.lineTo(QPointF(x + w + gap - 6, y + h/2 + 4)); arrow.closeSubpath()
+                scene.addPath(arrow, pen, QBrush(Qt.black))
+            x += w + gap
+        view.setScene(scene); view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
+        dlg.exec()
+
+
+class ExportTicketWindow(QMainWindow):
+    """
+    导出组合票（独立于数据校对）
+    步骤表字段：
+      序号 / 工序显示名 / 
+```

@@ -1,0 +1,189 @@
+
+
+# -*- coding: utf-8 -*-
+"""
+FlowView — 将表格数据以“框 + 箭头”的流程图方式展示。
+
+使用方式：
+    from checker_ui.ui.flow_view import FlowView
+    view = FlowView(parent)
+    view.render(defs)   # defs 为现有收集的步骤定义列表
+
+约定：
+    defs: List[Dict]
+        每一行至少包含：
+            - display: 子步骤显示名
+            - group:   岗位/工位组名（相邻相同 group 视为同一岗位框）
+            - durations: [服务时长(秒), ...]
+            - color:  可选十六进制色值（岗位框填充色）
+
+本模块只负责可视化展示，不改变任何调度/导出逻辑。
+"""
+from __future__ import annotations
+
+from typing import List, Dict, Tuple
+
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal
+from PySide6.QtGui import QColor, QPen, QBrush, QPainterPath
+from PySide6.QtWidgets import (
+    QGraphicsView,
+    QGraphicsScene,
+    QGraphicsRectItem,
+    QGraphicsSimpleTextItem,
+    QGraphicsPathItem,
+)
+
+
+class _NodeItem(QGraphicsRectItem):
+    """岗位框节点。双击时请求打开属性编辑。"""
+    def __init__(self, rect: QRectF, group_id: str, view: "FlowView") -> None:
+        super().__init__(rect)
+        self._gid = group_id
+        self._view = view
+        # 让框更好看一些
+        self.setPen(QPen(QColor("#444"), 1.2))
+        self.setBrush(QBrush(QColor("#dbeafe")))  # 默认淡蓝
+        self.setFlags(
+            QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable
+        )
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802 (Qt 命名保持)
+        # 通知视图打开该 group 的属性对话框
+        self._view.editRequested.emit(self._gid)
+        super().mouseDoubleClickEvent(event)
+
+
+class FlowView(QGraphicsView):
+    """把现有的 defs 渲染成简洁的流程图视图。"""
+
+    # 双击某个岗位框时发出（参数：group_id）
+    editRequested = Signal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self.setRenderHints(self.renderHints() | self.RenderHint.Antialiasing)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+
+        # 缩放参数
+        self._scale_per_notch = 1.15
+        self._min_scale, self._max_scale = 0.25, 3.0
+
+    # ---------- 交互：滚轮缩放 ---------- #
+    def wheelEvent(self, ev):  # noqa: N802 (Qt 命名保持)
+        if ev.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            factor = self._scale_per_notch if ev.angleDelta().y() > 0 else (1.0 / self._scale_per_notch)
+            cur = self.transform().m11()
+            new_scale = cur * factor
+            if self._min_scale <= new_scale <= self._max_scale:
+                self.scale(factor, factor)
+            ev.accept()
+            return
+        super().wheelEvent(ev)
+
+    # ---------- 对外：渲染入口 ---------- #
+    def render(self, defs: List[Dict]) -> None:
+        """根据 defs 重绘流程图。"""
+        scene = self.scene()
+        scene.clear()
+        if not defs:
+            return
+
+        groups = self._group_defs(defs)
+
+        # 布局参数
+        start_x, start_y = 40.0, 40.0
+        node_w, base_h = 220.0, 80.0
+        x_gap, y_gap = 60.0, 80.0
+
+        nodes: List[_NodeItem] = []
+        right_edge = start_x
+
+        # 逐个岗位绘制节点
+        for idx, (gid, ginfo) in enumerate(groups):
+            steps = ginfo["steps"]  # [(name, sec), ...]
+            # 根据子步骤多少自适应高度
+            h = base_h + max(0, len(steps) - 1) * 18.0
+            rect = QRectF(0, 0, node_w, h)
+            node = _NodeItem(rect, gid, self)
+
+            # 颜色：优先岗位自定义颜色
+            if ginfo.get("color"):
+                node.setBrush(QBrush(QColor(str(ginfo["color"])).lighter(110)))
+
+            # 位置：水平排布
+            node.setPos(start_x + idx * (node_w + x_gap), start_y)
+            scene.addItem(node)
+            nodes.append(node)
+
+            # 文本：标题 + 子步骤及时长
+            title = gid
+            lines = [f"• {n}  {sec:.1f}s" for n, sec in steps]
+            text = title + ("\n" + "\n".join(lines) if lines else "")
+            label = QGraphicsSimpleTextItem(text, node)
+            label.setPos(10, 8)
+
+            right_edge = max(right_edge, node.pos().x() + node_w)
+
+        # 岗位之间连线
+        for i in range(len(nodes) - 1):
+            a = nodes[i].sceneBoundingRect()
+            b = nodes[i + 1].sceneBoundingRect()
+            y = a.center().y()
+            self._add_arrow(QPointF(a.right(), y), QPointF(b.left(), y))
+
+        # 视图自适应
+        scene.setSceneRect(scene.itemsBoundingRect().marginsAdded(QRectF(0, 0, 80, 80)))
+        self.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    # ---------- 工具：把行聚合为岗位 ---------- #
+    def _group_defs(self, defs: List[Dict]) -> List[Tuple[str, Dict]]:
+        groups: List[Tuple[str, Dict]] = []
+        cur_gid = None
+        cur_bucket = None
+        for d in defs:
+            gid = (d.get("group") or d.get("display") or "").strip()
+            if not gid:
+                continue
+            if gid != cur_gid:
+                cur_gid = gid
+                cur_bucket = {"steps": [], "color": d.get("color")}
+                groups.append((gid, cur_bucket))
+            # 取首个时长显示为子步骤时长
+            dur = 0.0
+            try:
+                seqs = d.get("durations") or []
+                if seqs:
+                    dur = float(seqs[0])
+            except Exception:
+                pass
+            cur_bucket["steps"].append((str(d.get("display") or ""), float(dur)))
+        return groups
+
+    # ---------- 工具：画箭头 ---------- #
+    def _add_arrow(self, p0: QPointF, p1: QPointF) -> None:
+        path = QPainterPath(p0)
+        path.lineTo(p1)
+        # 箭头三角
+        vec = p1 - p0
+        L = max(1.0, (vec.x() ** 2 + vec.y() ** 2) ** 0.5)
+        ux, uy = vec.x() / L, vec.y() / L
+        ah = 10.0  # 箭头长度
+        aw = 5.0   # 箭头宽的一半
+        tip = p1
+        base = QPointF(p1.x() - ux * ah, p1.y() - uy * ah)
+        left = QPointF(base.x() + (-uy) * aw, base.y() + ux * aw)
+        right = QPointF(base.x() - (-uy) * aw, base.y() - ux * aw)
+
+        pen = QPen(QColor("#34495e")); pen.setWidthF(1.4)
+        item = QGraphicsPathItem(path)
+        item.setPen(pen)
+        self.scene().addItem(item)
+
+        tri = QPainterPath(tip)
+        tri.lineTo(left); tri.lineTo(right); tri.closeSubpath()
+        tri_item = QGraphicsPathItem(tri)
+        tri_item.setPen(pen)
+        tri_item.setBrush(QBrush(QColor("#34495e")))
+        self.scene().addItem(tri_item)

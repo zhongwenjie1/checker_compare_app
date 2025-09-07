@@ -1,0 +1,230 @@
+# checker_ui/ui/workstation_dialog.py
+
+## Classes & Methods
+{
+  "classes": [
+    {
+      "name": "WorkstationDialog",
+      "methods": [
+        "__init__",
+        "_pick_color",
+        "_add_row",
+        "_del_row",
+        "_move_row",
+        "_accept"
+      ]
+    }
+  ],
+  "functions": []
+}
+
+## Head Snippet
+```
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+from typing import List, Dict, Any, Optional
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QDoubleSpinBox,
+    QSpinBox, QComboBox, QPushButton, QColorDialog, QCheckBox, QTableWidget,
+    QTableWidgetItem, QWidget, QLabel, QRadioButton, QButtonGroup, QGroupBox
+)
+from PySide6.QtGui import QColor
+
+
+class WorkstationDialog(QDialog):
+    """“新增岗位”向导：产出要插入表格的若干行定义。"""
+    acceptedWithData = Signal(dict)  # 发射完整配置
+
+    def __init__(self, parent: Optional[QWidget] = None, known_zones: List[str] = None):
+        super().__init__(parent)
+        self.setWindowTitle("新增岗位")
+        self.resize(560, 620)
+        known_zones = known_zones or []
+
+        # ===== 基础信息 =====
+        base_box = QGroupBox("基础")
+        base_form = QFormLayout(base_box)
+        self.ed_name = QLineEdit()
+        self.ed_display = QLineEdit()
+        self.cmb_zone = QComboBox()
+        self.cmb_zone.setEditable(True)
+        self.cmb_zone.addItems(known_zones)
+        self.btn_color = QPushButton("选择颜色…")
+        self._chosen_color: Optional[QColor] = None
+        self.btn_color.clicked.connect(self._pick_color)
+        base_form.addRow("岗位名称 *", self.ed_name)
+        base_form.addRow("岗位显示名", self.ed_display)
+
+        hz = QHBoxLayout()
+        hz.addWidget(self.cmb_zone, 1)
+        hz.addWidget(self.btn_color)
+        wrap = QWidget(); wrap.setLayout(hz)
+        base_form.addRow("所属区域ID *", wrap)
+
+        # ===== 节拍/并行 =====
+        perf_box = QGroupBox("节拍 & 并行能力")
+        perf_form = QFormLayout(perf_box)
+        self.sp_cycle = QDoubleSpinBox(); self.sp_cycle.setRange(0, 99999); self.sp_cycle.setDecimals(1); self.sp_cycle.setValue(0.0)
+        self.sp_cap = QSpinBox(); self.sp_cap.setRange(1, 99); self.sp_cap.setValue(1)
+        perf_form.addRow("岗位节拍(秒)", self.sp_cycle)
+        perf_form.addRow("并行能力(台)", self.sp_cap)
+
+        # ===== 子步骤表 =====
+        steps_box = QGroupBox("子步骤（可自定义/可套模板）")
+        v2 = QVBoxLayout(steps_box)
+        toolbar = QHBoxLayout()
+        self.btn_add = QPushButton("＋新增")
+        self.btn_del = QPushButton("－删除")
+        self.btn_up = QPushButton("↑上移")
+        self.btn_dn = QPushButton("↓下移")
+        for b in (self.btn_add, self.btn_del, self.btn_up, self.btn_dn):
+            toolbar.addWidget(b)
+        toolbar.addStretch(1)
+        v2.addLayout(toolbar)
+
+        self.tbl = QTableWidget(0, 2)
+        self.tbl.setHorizontalHeaderLabels(["子步骤名称", "作业时长(秒)"])
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        v2.addWidget(self.tbl)
+
+        self.btn_add.clicked.connect(self._add_row)
+        self.btn_del.clicked.connect(self._del_row)
+        self.btn_up.clicked.connect(lambda: self._move_row(-1))
+        self.btn_dn.clicked.connect(lambda: self._move_row(+1))
+
+        # ===== 闸门（可选） =====
+        gate_box = QGroupBox("闸门（可选）")
+        gate_form = QFormLayout(gate_box)
+        self.chk_gate = QCheckBox("启用闸门")
+        self.cmb_gate_zone = QComboBox(); self.cmb_gate_zone.setEditable(True); self.cmb_gate_zone.addItems(known_zones)
+        self.sp_gate_buf = QSpinBox(); self.sp_gate_buf.setRange(1, 20); self.sp_gate_buf.setValue(2)
+        gate_form.addRow(self.chk_gate)
+        gate_form.addRow("阻塞区域ID", self.cmb_gate_zone)
+        gate_form.addRow("闸门缓冲", self.sp_gate_buf)
+
+        # ===== 插入位置 =====
+        ins_box = QGroupBox("插入位置")
+        v3 = QVBoxLayout(ins_box)
+        self.rb_before_selected = QRadioButton("在当前选中行之前插入")
+        self.rb_at_index = QRadioButton("在第 X 行之前")
+        self.rb_append = QRadioButton("追加到末尾")
+        self.rb_before_selected.setChecked(True)
+        self.spin_index = QSpinBox(); self.spin_index.setRange(1, 9999); self.spin_index.setValue(1)
+        hidx = QHBoxLayout(); hidx.addWidget(self.rb_at_index); hidx.addWidget(self.spin_index); hidx.addStretch(1)
+        v3.addWidget(self.rb_before_selected)
+        v3.addLayout(hidx)
+        v3.addWidget(self.rb_append)
+
+        # ===== 按钮区 =====
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        self.btn_preview = QPushButton("预览")
+        self.btn_cancel = QPushButton("取消")
+        self.btn_ok = QPushButton("确定")
+        btns.addWidget(self.btn_preview)
+        btns.addWidget(self.btn_cancel)
+        btns.addWidget(self.btn_ok)
+
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_ok.clicked.connect(self._accept)
+
+        # ===== 布局总装 =====
+        root = QVBoxLayout(self)
+        root.addWidget(base_box)
+        root.addWidget(perf_box)
+        root.addWidget(steps_box, 1)
+        root.addWidget(gate_box)
+        root.addWidget(ins_box)
+        root.addLayout(btns)
+
+        # 默认放三行示例
+        for name, dur in [("准备", 30.0), ("作业1", 60.0), ("结束", 30.0)]:
+            self._add_row(name, dur)
+
+    # ---------- helpers ----------
+    def _pick_color(self):
+        c = QColorDialog.getColor(self._chosen_color or QColor("#4CAF50"), self, "选择颜色")
+        if c.isValid():
+            self._chosen_color = c
+            swatch = "background: %s; color: %s" % (c.name(), "#000" if c.lightness() > 128 else "#FFF")
+            self.btn_color.setStyleSheet(swatch)
+
+    def _add_row(self, name: str = "", dur: float = 0.0):
+        r = self.tbl.rowCount()
+        self.tbl.insertRow(r)
+        item_name = QTableWidgetItem(name); item_name.setFlags(item_name.flags() | Qt.ItemIsEditable)
+        item_dur = QTableWidgetItem(str(dur)); item_dur.setFlags(item_dur.flags() | Qt.ItemIsEditable)
+        self.tbl.setItem(r, 0, item_name)
+        self.tbl.setItem(r, 1, item_dur)
+
+    def _del_row(self):
+        r = self.tbl.currentRow()
+        if r >= 0:
+            self.tbl.removeRow(r)
+
+    def _move_row(self, delta: int):
+        r = self.tbl.currentRow()
+        if r < 0: return
+        n = self.tbl.rowCount()
+        nr = max(0, min(n - 1, r + delta))
+        if nr == r: return
+        # swap
+        name = self.tbl.item(r, 0).text(); dur = self.tbl.item(r, 1).text()
+        name2 = self.tbl.item(nr, 0).text(); dur2 = self.tbl.item(nr, 1).text()
+        self.tbl.item(r, 0).setText(name2); self.tbl.item(r, 1).setText(dur2)
+        self.tbl.item(nr, 0).setText(name); self.tbl.item(nr, 1).setText(dur)
+        self.tbl.setCurrentCell(nr, 0)
+
+    def _accept(self):
+        name = self.ed_name.text().strip()
+        zone = self.cmb_zone.currentText().strip()
+        if not name or not zone:
+            # 简单校验
+            self.ed_name.setFocus()
+            return
+        display = self.ed_display.text().strip() or name
+        color_hex = self._chosen_color.name() if self._chosen_color else None
+        cycle = float(self.sp_cycle.value())
+        cap = int(self.sp_cap.value())
+
+        steps: List[Dict[str, Any]] = []
+        total = 0.0
+        for i in range(self.tbl.rowCount()):
+            sname = (self.tbl.item(i, 0).text() if self.tbl.item(i, 0) else "").strip()
+            try:
+                dur = float(self.tbl.item(i, 1).text())
+            except Exception:
+                dur = 0.0
+            if sname and dur > 0:
+                total += dur
+                steps.append({"name": sname, "duration": dur})
+
+        gate = None
+        if self.chk_gate.isChecked():
+            gate = {
+                "zone_id": self.cmb_gate_zone.currentText().strip(),
+                "buffer": int(self.sp_gate_buf.value()),
+            }
+
+        if self.rb_before_selected.isChecked():
+            insert = {"mode": "before_selected", "index": -1}
+        elif self.rb_at_index.isChecked():
+            insert = {"mode": "before_index", "index": int(self.spin_index.value())}
+        else:
+            insert = {"mode": "append", "index": -1}
+
+        payload = {
+            "station_id": name,
+            "station_display": display,
+            "zone_id": zone,
+            "color": color_hex,
+            "cycle_time": cycle if cycle > 0 else None,
+            "zone_capacity": cap,
+            "steps": steps,
+            "gate": gate,
+            "insert": insert,
+        }
+        self.acceptedWithData.emit(payload)
+        self.accept()
+```

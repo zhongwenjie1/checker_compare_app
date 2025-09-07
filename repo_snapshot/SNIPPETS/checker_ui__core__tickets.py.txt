@@ -1,0 +1,330 @@
+# checker_ui/core/tickets.py
+
+## Classes & Methods
+{
+  "classes": [],
+  "functions": [
+    "_choose_engine",
+    "_apply_area_station_overrides",
+    "_auto_infer_rules",
+    "_pick_primary_cycle",
+    "_normalize_defs",
+    "schedule",
+    "_build_car_slices",
+    "_compute_entry_wait",
+    "_compute_total_wait",
+    "schedule_and_export",
+    "_palette",
+    "_fmt_num",
+    "_export_with_xlsxwriter",
+    "_export_with_openpyxl"
+  ]
+}
+
+## Head Snippet
+```
+# -*- coding: utf-8 -*-
+"""
+组合票排程 + 导出
+- Zone（阻塞区域）：同一 zone_id 的连续步骤视为同一区域，容量=可同时处于区域的车辆数。
+- gate_zone（闸门）+ gate_buffer（缓冲）：对上游某些步骤设 gate_zone=某区域，
+  表示该步骤“开工前/放行时”需要考虑该区域前的“闸门缓冲”是否已满。
+  gate_buffer=缓冲允许在“闸门 → 区域入口”链路上同时存在的在制车数量（默认=2）。
+  这样可实现：2 号车能继续到电检1，但 3 号车需等 2 号车进入电检2 后才开始电检准备。
+"""
+
+from __future__ import annotations
+import math
+import heapq
+from typing import List, Dict, Any, Tuple
+import pandas as pd
+from checker_ui.models.state import AppState
+
+
+# ---------------- Excel 引擎选择 ---------------- #
+
+def _choose_engine():
+    try:
+        import xlsxwriter  # noqa: F401
+        return "xlsxwriter"
+    except Exception:
+        try:
+            import openpyxl  # noqa: F401
+            return "openpyxl"
+        except Exception:
+            return None
+
+# ---------------- 在调度前应用“区域→岗位”覆盖 ---------------- #
+def _apply_area_station_overrides(defs: List[Dict[str, Any]], state: AppState) -> List[Dict[str, Any]]:
+    """
+    将每一行定义中的 zone_id / gate_zone_id 用岗位ID（station_id）覆盖；
+    并且把岗位节拍（station_cycle_times）写入到 cycle_time 字段。
+    仅改变调度用的标识，不改变实际 dur（作业时长）。
+    """
+    a2s: Dict[str, str] = getattr(state, "area_to_station", {}) or {}
+    sct: Dict[str, float] = getattr(state, "station_cycle_times", {}) or {}
+
+    new_defs: List[Dict[str, Any]] = []
+    for d in defs:
+        nd = dict(d)  # 复制，避免原数据被修改
+        zid = str(nd.get("zone_id", "") or "").strip()
+        if zid:
+            sid = str(a2s.get(zid, zid)).strip()
+            nd["zone_id"] = sid
+            # 若该岗位配置了节拍，覆盖写入 cycle_time（仅影响区域入口的节拍限流）
+            ct = sct.get(sid, None)
+            if ct not in (None, ""):
+                try:
+                    nd["cycle_time"] = float(ct)
+                except Exception:
+                    pass
+
+        gz = str(nd.get("gate_zone_id", "") or "").strip()
+        if gz:
+            nd["gate_zone_id"] = str(a2s.get(gz, gz)).strip()
+
+        new_defs.append(nd)
+    return new_defs
+
+
+ # -------------- 自动推断 规则（闸门/缓冲/容量） -------------- #
+def _auto_infer_rules(defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    输入：UI 收集的步骤 defs（可能没有 gate / gate_buffer / zone_capacity）
+    输出：填充了默认闸门、缓冲和区域容量的 defs（原地修改并返回）
+    规则：
+      - 若某行有 zone_id 且未给 zone_capacity，则用 capacity 作为 zone_capacity（默认1）
+      - 从下往上扫描，维护“下游最近的 zone_id”。对没有 zone_id 的行：
+          若存在下游 zone_id = Z，则自动设置 gate_zone_id = Z，gate_buffer = 2
+    """
+    n = len(defs)
+    if n == 0:
+        return defs
+
+    # 1) 区域容量默认：zone_capacity <- capacity
+    for rec in defs:
+        zid = str(rec.get("zone_id") or "").strip()
+        if zid:
+            if "zone_capacity" not in rec or rec.get("zone_capacity") in (None, "", 0, "0"):
+                try:
+                    cap = max(1, int(float(rec.get("capacity", 1))))
+                except Exception:
+                    cap = 1
+                rec["zone_capacity"] = cap
+
+    # 2) 闸门/缓冲自动：自下而上找“下游最近的区域”
+    next_zone_ahead: str | None = None
+    for i in range(n - 1, -1, -1):
+        rec = defs[i]
+        zid = str(rec.get("zone_id") or "").strip()
+        if zid:
+            next_zone_ahead = zid
+            # 本行属于某个区域，不自动加 gate
+            continue
+
+        # 本行不在任何区域里：若下游存在区域，则加 gate 到那个区域
+        if next_zone_ahead:
+            if not rec.get("gate_zone_id"):
+                rec["gate_zone_id"] = next_zone_ahead
+            # 默认缓冲：若未显式给，设为 2
+            if not rec.get("gate_buffer"):
+                rec["gate_buffer"] = 2
+
+    return defs
+
+# ---------------- 新增：选主节拍 ---------------- #
+def _pick_primary_cycle(step_defs: List[Dict[str, Any]]) -> float:
+    """
+    从 defs 中选择“主节拍”（秒）：
+      1) 先按 zone_id 聚合（同一区域多行：取最大值，更保守）；
+      2) 在所有区域节拍中：若有众数，取众数；否则取最大值；
+      3) 若完全没有，返回 0（不画竖线）。
+    """
+    from collections import Counter
+
+    zone_ct: Dict[str, float] = {}
+    for d in step_defs:
+        zid = str(d.get("zone_id", "") or "").strip()
+        ct = d.get("cycle_time", None)
+        try:
+            ct = float(ct) if ct not in (None, "") else None
+        except Exception:
+            ct = None
+        if not zid or ct is None or ct <= 0:
+            continue
+        zone_ct[zid] = max(zone_ct.get(zid, 0.0), float(ct))
+
+    if not zone_ct:
+        return 0.0
+
+    vals = list(zone_ct.values())
+    # 统计众数：考虑浮点误差，四舍五入到 1 位小数后计数
+    rounded = [round(v, 1) for v in vals]
+    cnt = Counter(rounded)
+    most, freq = cnt.most_common(1)[0]
+    if len(cnt) == 1 or (len(cnt) > 1 and freq > sorted(cnt.values())[-2]):
+        return float(most)
+    return float(max(vals))
+
+
+# ---------------- 解析步骤与 Zone ---------------- #
+def _normalize_defs(step_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, int], Dict[str, float]]:
+    """
+    返回 (steps, zones, gate_buffers, zone_cycles)
+
+    steps: 每步 {seq, display, group, duration, zone_id, gate_zone_id, cycle_time}
+    zones: {zid: {"capacity": int, "first_seq": int, "last_seq": int}}
+    gate_buffers: {zid: gate_buffer_int}  # 若未显式提供，默认=2
+    zone_cycles: {zid: float}  # 区域节拍（秒）；仅在该区域入口步生效
+    """
+    steps: List[Dict[str, Any]] = []
+    # 收集 gate_buffer（按 zone 聚合，取出现的最大值；默认=2）
+    gate_buffers: Dict[str, int] = {}
+    # 收集每个区域的节拍（取该区域出现的最大值，更保守）
+    zone_cycles: Dict[str, float] = {}
+
+    for d in step_defs:
+        display = str(d.get("display", "")).strip()
+        group = str(d.get("group", "")).strip() or display
+        durations = list(d.get("durations", []))
+        if not display or not durations:
+            continue
+        dur = float(durations[0])
+
+        # 读取节拍字段（不覆盖实际作业时长）
+        cycle_time_val = d.get("cycle_time", None)
+        ct: float | None = None
+        if cycle_time_val not in (None, ""):
+            try:
+                ct = float(cycle_time_val)
+                if not (ct > 0):
+                    ct = None
+            except Exception:
+                ct = None
+
+        zone_id = str(d.get("zone_id", "") or "").strip()
+        gate_zone_id = str(d.get("gate_zone_id", "") or "").strip()
+
+        # 聚合节拍到 zone（仅按区域入口使用，不改变条形长度）
+        if zone_id and ct is not None:
+            if zone_id in zone_cycles:
+                zone_cycles[zone_id] = max(zone_cycles[zone_id], ct)
+            else:
+                zone_cycles[zone_id] = ct
+
+        # 聚合 gate_buffer
+        if gate_zone_id:
+            gb = d.get("gate_buffer", None)
+            if gb is None:
+                gb = 2  # 默认缓冲=2，符合“2号车可走，3号车等”的现场规则
+            try:
+                gb = max(1, int(float(gb)))
+            except Exception:
+                gb = 2
+            if gate_zone_id in gate_buffers:
+                gate_buffers[gate_zone_id] = max(gate_buffers[gate_zone_id], gb)
+            else:
+                gate_buffers[gate_zone_id] = gb
+
+        steps.append({
+            "seq": int(d.get("seq", len(steps) + 1)),
+            "display": display,
+            "group": group,
+            "duration": dur,
+            "zone_id": zone_id,
+            "gate_zone_id": gate_zone_id,
+            "cycle_time": ct,  # 区域节拍（秒），仅在区域入口限流使用
+        })
+
+    steps.sort(key=lambda x: x["seq"])
+    if not steps:
+        raise ValueError("没有有效的步骤定义")
+
+    # 汇总 Zone：确定起止步骤序号 + 容量
+    zones: Dict[str, Dict[str, Any]] = {}
+    for s in steps:
+        zid = s.get("zone_id", "")
+        if not zid:
+            continue
+        z = zones.setdefault(zid, {"capacity": 1, "first_seq": s["seq"], "last_seq": s["seq"]})
+        z["first_seq"] = min(z["first_seq"], s["seq"])
+        z["last_seq"] = max(z["last_seq"], s["seq"])
+
+    # 从原始定义里补全 zone 容量
+    for d in step_defs:
+        zid = str(d.get("zone_id", "") or "").strip()
+        if not zid or zid not in zones:
+            continue
+        zcap = d.get("zone_capacity", None)
+        if zcap is not None:
+            try:
+                zones[zid]["capacity"] = max(int(zones[zid]["capacity"]), int(zcap))
+            except Exception:
+                pass
+
+    # gate_buffer 若某个 gate_zone 没出现在任何行里，忽略；出现但没显式给值时已默认为 2
+    return steps, zones, gate_buffers, zone_cycles
+
+
+# ---------------- 调度（含 Zone + gate_buffer） ---------------- #
+def schedule(step_defs: List[Dict[str, Any]], cars: int) -> Tuple[List[Dict[str, Any]], float]:
+    """
+    返回：
+      rows: 每车-每步记录：
+        {car, step_seq, step_display, group, dur, start, svc_finish, depart, block_wait}
+      max_time: 全局最后 depart
+    """
+    steps, zones, gate_buffers, zone_cycles = _normalize_defs(step_defs)
+    m = len(steps)
+
+    # 工位释放时刻（考虑阻塞传递）
+    server_free = [0.0 for _ in range(m)]
+
+    # Zone 名额堆：zid -> [free_time, ...]（长度=capacity）
+    zone_heaps: Dict[str, List[float]] = {}
+    for zid, zinfo in zones.items():
+        cap = int(zinfo.get("capacity", 1)) or 1
+        zone_heaps[zid] = [0.0 for _ in range(cap)]
+        heapq.heapify(zone_heaps[zid])
+
+    # 闸门缓冲：对每个 gate_zone 维护“尚未进入该 zone 的车辆的预计进入时刻”最小堆
+    # pre_heap[z] 中的元素是“已经通过闸门但尚未进入 zone 的车辆的 ‘zone 入口开始时间’ ”
+    pre_heap: Dict[str, List[float]] = {}
+
+    # 记录每个区域上一次车辆进入该区域入口的时刻（用于节拍约束）
+    last_entry_time: Dict[str, float] = {}
+
+    def is_zone_entry(idx: int) -> bool:
+        s = steps[idx]
+        zid = s.get("zone_id", "")
+        if not zid:
+            return False
+        return s["seq"] == zones[zid]["first_seq"]
+
+    def is_zone_exit(idx: int) -> bool:
+        s = steps[idx]
+        zid = s.get("zone_id", "")
+        if not zid:
+            return False
+        return s["seq"] == zones[zid]["last_seq"]
+
+    rows: List[Dict[str, Any]] = []
+    max_time = 0.0
+
+    for car in range(1, cars + 1):
+        prev_depart = 0.0
+        # 记录该车是否经过某个 gate_zone（用于之后把它的“进入 zone 的时刻”加入 pre_heap）
+        car_gate_zones: set[str] = set()
+
+        for j, st in enumerate(steps):
+            # ---- 计算本步开始时间：受上一步 depart、本步服务器空闲约束 ----
+            start = max(server_free[j], prev_depart)
+
+            # ---- 闸门缓冲约束（在 start 阶段判断）：允许“闸门→区域入口”链路上最多 gate_buffer 辆 ----
+            gz = st.get("gate_zone_id", "")
+            if gz:
+                car_gate_zones.add(gz)
+                # 取得该 gate_zone 的缓冲与堆
+                gb = max(1, int(gate_buffers.get(gz, 2)))
+                heap = pre_heap.setdefau
+```

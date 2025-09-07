@@ -1,0 +1,12 @@
+# checker_ui/core/__init__.py
+
+## Classes & Methods
+{
+  "classes": [],
+  "functions": []
+}
+
+## Head Snippet
+```
+__all__ = []
+```

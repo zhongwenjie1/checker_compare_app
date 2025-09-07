@@ -1,7 +1,8 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableView,
     QFileDialog, QPushButton, QLabel, QStatusBar, QMessageBox,
-    QSplitter, QToolBar, QHeaderView, QSizePolicy
+    QSplitter, QToolBar, QHeaderView, QSizePolicy,
+    QDockWidget, QTableWidget, QTableWidgetItem
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt, QThreadPool, QTimer
@@ -10,7 +11,9 @@ from ..models.state import AppState
 from ..models.dataframe_model import DataFrameModel
 from ..infra.threads import Worker
 
+
 from ..core import loaders as loaders, comparator as comparator, exporter as exporter
+from .area_panel import AreaPanel
 
 
 class MainWindow(QMainWindow):
@@ -20,6 +23,10 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
 
         self.state = AppState()
+        try:
+            self.state.load_state()
+        except Exception:
+            pass
         self.thread_pool = QThreadPool.globalInstance()
 
         self._build_ui()
@@ -47,6 +54,10 @@ class MainWindow(QMainWindow):
         self.act_export = QAction("导出Excel", self)
         # 新增：自适应列宽（一次）
         self.act_fit_cols = QAction("自适应列宽（一次）", self)
+        # 新增：区域面板显示/隐藏
+        self.act_toggle_area = QAction("区域面板", self)
+        self.act_toggle_area.setCheckable(True)
+        self.act_toggle_area.setChecked(True)
 
         tb.addAction(self.act_open_std)
         tb.addAction(self.act_open_sys)
@@ -56,6 +67,8 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_export)
         tb.addSeparator()
         tb.addAction(self.act_fit_cols)
+        tb.addSeparator()
+        tb.addAction(self.act_toggle_area)
 
         # 中央区域
         central = QWidget()
@@ -112,6 +125,18 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setChildrenCollapsible(False)
         layout.addWidget(splitter)
+
+        # —— 区域面板 Dock ——
+        try:
+            self._area_panel = AreaPanel(self.state, self)
+            self._dock_area = QDockWidget("区域面板（区域→岗位 & 节拍）", self)
+            self._dock_area.setObjectName("dock_area_panel")
+            self._dock_area.setWidget(self._area_panel)
+            self._dock_area.setMinimumWidth(320)
+            self.addDockWidget(Qt.RightDockWidgetArea, self._dock_area)
+            self._dock_area.visibilityChanged.connect(self.act_toggle_area.setChecked)
+        except Exception as _e:
+            print("AreaPanel init failed:", _e)
 
         # 底部状态栏
         self.status = QStatusBar()
@@ -190,6 +215,9 @@ class MainWindow(QMainWindow):
             lambda: (self._autosize_columns_fast(self.table_std),
                      self._autosize_columns_fast(self.table_sys))
         )
+        # 区域面板显示/隐藏
+        if hasattr(self, "_dock_area"):
+            self.act_toggle_area.toggled.connect(self._dock_area.setVisible)
 
     # 便于“入口页 -> 传入路径”复用
     def load_std_path(self, path: str):
