@@ -3,277 +3,27 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QToolBar, QStatusBar, QMessageBox, QTableWidget,
     QTableWidgetItem, QSpinBox, QComboBox, QLineEdit, QColorDialog,
-    QGraphicsScene, QGraphicsView, QGraphicsRectItem, QGraphicsTextItem, QGraphicsLineItem, QSplitter, QDialog,
-    QDockWidget, QFormLayout, QDoubleSpinBox, QDialogButtonBox, QMenu, QAbstractItemView
+    QGraphicsScene, QGraphicsView, QGraphicsRectItem, QGraphicsTextItem, QGraphicsLineItem, QSplitter, QDialog, QTabWidget
 )
 from PySide6.QtCore import Qt, QThreadPool, QPointF
-
 from PySide6.QtGui import QAction, QColor, QPainter, QPainterPath, QPen, QBrush
+import os
+from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
+from openpyxl.styles import PatternFill, Border, Side
 
-# 功能开关：是否显示右侧“区域面板”
-FEATURE_SHOW_AREA_PANEL = False
+try:
+    from checker_ui import __version__
+except Exception:
+    __version__ = "dev"
 
-
+# Worker & tickets import with package-relative fallback (works in installed or dev mode)
 try:
     from checker_ui.infra.threads import Worker
     from checker_ui.core import tickets
 except Exception:
     from ..infra.threads import Worker
     from ..core import tickets
-
-
-try:
-    from checker_ui.ui.workstation_dialog import WorkstationDialog
-except Exception:
-    from ..ui.workstation_dialog import WorkstationDialog
-
-# FlowView fallback import
-try:
-    from checker_ui.ui.flow_view import FlowView
-except Exception:
-    from ..ui.flow_view import FlowView
-
-
-# 区域面板（仅用于本窗口表格）
-class _ExportAreaPanel(QWidget):
-    """右侧区域面板（仅作用于本窗口的表格）。
-    - 列出当前表格中出现的所有 区域ID；
-    - 为选中区域批量设置“节拍时间(秒)”（会写入该区域所有行的第6列）。
-    """
-    def __init__(self, host_window: 'ExportTicketWindow'):
-        super().__init__(host_window)
-        self.host = host_window
-        self._programmatic = False  # 防止 itemChanged 的循环触发
-
-        lay = QFormLayout(self)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(8)
-
-        self.cmb_zone = QComboBox(self)
-        lay.addRow("区域ID：", self.cmb_zone)
-
-        self.spn_cycle = QDoubleSpinBox(self)
-        self.spn_cycle.setRange(0.0, 99999.0)
-        self.spn_cycle.setDecimals(1)
-        self.spn_cycle.setSingleStep(0.5)
-        self.spn_cycle.setValue(0.0)
-        lay.addRow("节拍时间(秒)：", self.spn_cycle)
-
-        self.btn_apply = QPushButton("应用节拍到该区域", self)
-        lay.addRow("", self.btn_apply)
-
-        self.cmb_zone.currentTextChanged.connect(self._sync_cycle_from_table)
-        self.btn_apply.clicked.connect(self._apply_cycle_to_zone)
-
-    def rebuild_zones(self):
-        zones = []
-        seen = set()
-        tbl = self.host.tbl
-        for r in range(tbl.rowCount()):
-            item = tbl.item(r, 6)  # 区域ID列
-            zid = item.text().strip() if item else ""
-            if zid and zid not in seen:
-                seen.add(zid)
-                zones.append(zid)
-        self._programmatic = True
-        try:
-            self.cmb_zone.clear()
-            self.cmb_zone.addItems(zones)
-        finally:
-            self._programmatic = False
-        # 选区后同步一次节拍显示
-        if zones:
-            self._sync_cycle_from_table(zones[0])
-        else:
-            self.spn_cycle.setValue(0.0)
-
-    def _sync_cycle_from_table(self, zid: str):
-        if self._programmatic:
-            return
-        if not zid:
-            self.spn_cycle.setValue(0.0)
-            return
-        # 读取该区域在表中的最大节拍（为空按0）
-        tbl = self.host.tbl
-        max_ct = 0.0
-        for r in range(tbl.rowCount()):
-            zitem = tbl.item(r, 6)
-            if not zitem:
-                continue
-            if (zitem.text().strip() == zid):
-                ct_item = tbl.item(r, 5)
-                if ct_item:
-                    try:
-                        v = float(ct_item.text().strip())
-                        if v > max_ct:
-                            max_ct = v
-                    except Exception:
-                        pass
-        self.spn_cycle.setValue(max_ct)
-
-    def _apply_cycle_to_zone(self):
-        zid = self.cmb_zone.currentText().strip()
-        if not zid:
-            return
-        val = float(self.spn_cycle.value())
-        tbl = self.host.tbl
-        self._programmatic = True
-        try:
-            tbl.blockSignals(True)
-            for r in range(tbl.rowCount()):
-                zitem = tbl.item(r, 6)
-                if not zitem:
-                    continue
-                if zitem.text().strip() == zid:
-                    # 写入第6列：节拍时间(秒，可选)
-                    item = tbl.item(r, 5)
-                    if item is None:
-                        item = QTableWidgetItem("")
-                        tbl.setItem(r, 5, item)
-                    # 统一保留1位小数（与导出网格0.5/1.0常见设置匹配）
-                    item.setText(f"{val:.1f}" if abs(val - round(val)) > 1e-9 else str(int(round(val))))
-        finally:
-            tbl.blockSignals(False)
-            self._programmatic = False
-        # 应用后保持列表同步
-        self._sync_cycle_from_table(zid)
-
-    # 供表格变动时调用
-    def on_table_changed(self, *_):
-        if not self._programmatic:
-            self.rebuild_zones()
-
-
-# ========== 岗位属性对话框（编辑 & 预览） ==========
-class StationPropertiesDialog(QDialog):
-    """
-    输入/输出 payload 结构兼容 _insert_workstation_rows：
-      {
-        station_id, station_display, zone_id, color, cycle_time, zone_capacity,
-        steps: [{name, duration}, ...],
-        gate: {zone_id}
-      }
-    """
-    def __init__(self, parent, initial: dict):
-        super().__init__(parent)
-        self.setWindowTitle("岗位属性")
-        self.resize(680, 520)
-        self._color_hex = initial.get("color") or ""
-
-        lay = QVBoxLayout(self)
-
-        # 顶部：基础属性
-        row = QHBoxLayout(); lay.addLayout(row)
-        row.addWidget(QLabel("工位组名："))
-        self.ed_station = QLineEdit(initial.get("station_id", "")); self.ed_station.setReadOnly(True); self.ed_station.setFixedWidth(150); row.addWidget(self.ed_station)
-        row.addSpacing(10); row.addWidget(QLabel("显示名："))
-        self.ed_display = QLineEdit(initial.get("station_display", "") or initial.get("station_id", "")); self.ed_display.setFixedWidth(180); row.addWidget(self.ed_display)
-        row.addSpacing(10); row.addWidget(QLabel("区域ID："))
-        self.ed_zone = QLineEdit(initial.get("zone_id", "")); self.ed_zone.setFixedWidth(120); row.addWidget(self.ed_zone)
-
-        row2 = QHBoxLayout(); lay.addLayout(row2)
-        row2.addWidget(QLabel("节拍(秒)："))
-        self.spn_cycle = QDoubleSpinBox(); self.spn_cycle.setRange(0, 99999); self.spn_cycle.setDecimals(1); self.spn_cycle.setSingleStep(0.5)
-        self.spn_cycle.setValue(float(initial.get("cycle_time") or 0)); self.spn_cycle.setFixedWidth(120); row2.addWidget(self.spn_cycle)
-
-        row2.addSpacing(10); row2.addWidget(QLabel("区域容量："))
-        self.spn_cap = QSpinBox(); self.spn_cap.setRange(1, 99); self.spn_cap.setValue(int(initial.get("zone_capacity") or 1)); self.spn_cap.setFixedWidth(120); row2.addWidget(self.spn_cap)
-
-        row2.addSpacing(10); row2.addWidget(QLabel("起始需等区域ID："))
-        self.ed_gate = QLineEdit((initial.get("gate") or {}).get("zone_id", "")); self.ed_gate.setFixedWidth(140); row2.addWidget(self.ed_gate)
-
-        row2.addSpacing(10)
-        self.btn_color = QPushButton("颜色…")
-        if self._color_hex: self.btn_color.setStyleSheet(f"background:{self._color_hex};")
-        self.btn_color.clicked.connect(self._choose_color); row2.addWidget(self.btn_color)
-        row2.addStretch()
-
-        # 中部：步骤表
-        lay.addWidget(QLabel("步骤清单（名称 / 时长秒）"))
-        self.tbl = QTableWidget(0, 2, self)
-        self.tbl.setHorizontalHeaderLabels(["步骤名", "时长(秒)"])
-        self.tbl.verticalHeader().setVisible(False)
-        self.tbl.horizontalHeader().setStretchLastSection(True)
-        lay.addWidget(self.tbl, 1)
-
-        for st in (initial.get("steps") or []):
-            r = self.tbl.rowCount()
-            self.tbl.insertRow(r)
-            self.tbl.setItem(r, 0, QTableWidgetItem(str(st.get("name", ""))))
-            self.tbl.setItem(r, 1, QTableWidgetItem(str(st.get("duration", ""))))
-
-        # 步骤按钮
-        row3 = QHBoxLayout(); lay.addLayout(row3)
-        self.btn_add = QPushButton("添加步骤"); self.btn_del = QPushButton("删除步骤"); self.btn_preview = QPushButton("预览")
-        row3.addWidget(self.btn_add); row3.addWidget(self.btn_del); row3.addStretch(); row3.addWidget(self.btn_preview)
-        self.btn_add.clicked.connect(self._add_row)
-        self.btn_del.clicked.connect(self._del_row)
-        self.btn_preview.clicked.connect(self._preview)
-
-        # 按钮组
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
-        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-
-    def _choose_color(self):
-        col = QColorDialog.getColor(parent=self)
-        if col.isValid():
-            self._color_hex = col.name()
-            self.btn_color.setStyleSheet(f"background:{self._color_hex};")
-
-    def _add_row(self):
-        r = self.tbl.rowCount()
-        self.tbl.insertRow(r)
-        self.tbl.setItem(r, 0, QTableWidgetItem(""))
-        self.tbl.setItem(r, 1, QTableWidgetItem("0"))
-
-    def _del_row(self):
-        r = self.tbl.currentRow()
-        if r >= 0:
-            self.tbl.removeRow(r)
-
-    def payload(self) -> dict:
-        steps = []
-        for r in range(self.tbl.rowCount()):
-            name = self.tbl.item(r, 0).text().strip() if self.tbl.item(r, 0) else ""
-            dur_txt = self.tbl.item(r, 1).text().strip() if self.tbl.item(r, 1) else "0"
-            try: dur = float(dur_txt)
-            except Exception: dur = 0.0
-            steps.append({"name": name, "duration": dur})
-        return {
-            "station_id": self.ed_station.text().strip(),
-            "station_display": self.ed_display.text().strip() or self.ed_station.text().strip(),
-            "zone_id": self.ed_zone.text().strip(),
-            "color": self._color_hex,
-            "cycle_time": float(self.spn_cycle.value()),
-            "zone_capacity": int(self.spn_cap.value()),
-            "steps": steps,
-            "gate": {"zone_id": self.ed_gate.text().strip()} if self.ed_gate.text().strip() else {},
-        }
-
-    def _preview(self):
-        steps = self.payload().get("steps") or []
-        if not steps:
-            QMessageBox.information(self, "预览", "请先添加步骤"); return
-        dlg = QDialog(self); dlg.setWindowTitle("预览"); dlg.resize(780, 240)
-        v = QVBoxLayout(dlg)
-        view = QGraphicsView(); view.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
-        v.addWidget(view)
-        scene = QGraphicsScene(view)
-        x, y, w, h, gap = 0, 0, 110, 32, 22
-        pen = QPen(Qt.black, 1)
-        color = self._color_hex or "#90a4ae"
-        for i, st in enumerate(steps):
-            rect = QGraphicsRectItem(x, y, w, h); rect.setBrush(QBrush(QColor(color))); rect.setPen(pen); scene.addItem(rect)
-            txt = QGraphicsTextItem(st.get("name") or ("(显示名)" if i == 0 else "")); txt.setDefaultTextColor(Qt.black); txt.setPos(x + 4, y + 4); scene.addItem(txt)
-            if i < len(steps) - 1:
-                line = QGraphicsLineItem(x + w, y + h/2, x + w + gap, y + h/2); line.setPen(pen); scene.addItem(line)
-                arrow = QPainterPath(); arrow.moveTo(QPointF(x + w + gap, y + h/2))
-                arrow.lineTo(QPointF(x + w + gap - 6, y + h/2 - 4)); arrow.lineTo(QPointF(x + w + gap - 6, y + h/2 + 4)); arrow.closeSubpath()
-                scene.addPath(arrow, pen, QBrush(Qt.black))
-            x += w + gap
-        view.setScene(scene); view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
-        dlg.exec()
 
 
 class ExportTicketWindow(QMainWindow):
@@ -286,11 +36,12 @@ class ExportTicketWindow(QMainWindow):
       - 同一“区域ID”的一串连续步骤视为一个“阻塞区域（Zone）”，容量=同时允许几台车处于该区域。
       - “起始需等区域ID”用于上游工位：本工位本身不占用区域名额，但开工/放行必须等待该区域出现空位。
     """
-    COL_COLOR = 9
+    COL_COLOR = 8
+    MAX_SINGLE_STEPS = 40  # 单工程组合票：模板最多支持的行数
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("导出组合票")
+        self.setWindowTitle(f"导出组合票  v{__version__}")
         self.resize(1120, 720)
 
         self.thread_pool = QThreadPool.globalInstance()
@@ -298,29 +49,40 @@ class ExportTicketWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
-        self._col_cache = None
-
+    def _on_tab_changed(self, index: int):
+        """
+        Tab 切换时，控制顶部“添加步骤 / 删除步骤 / 填入示例”按钮：
+        - 仅在『多工程组合票』页签（第 0 个 Tab）启用；
+        - 在『单工程组合票』页签禁用，避免误点影响单工程表。
+        """
+        is_multi = (index == 0)
+        self.act_add_row.setEnabled(is_multi)
+        self.act_del_row.setEnabled(is_multi)
+        self.act_fill_sample.setEnabled(is_multi)
     # ---------------- UI ---------------- #
     def _build_ui(self):
         tb = QToolBar("Ticket")
         self.addToolBar(tb)
 
-        # 仅保留：返回主页 / 流程图 / 新增岗位 / 属性
         self.act_back = QAction("返回主页", self)
         tb.addAction(self.act_back)
+        tb.addSeparator()
+
+        self.act_help = QAction("帮助", self)
+        tb.addAction(self.act_help)
         tb.addSeparator()
 
         self.act_diagram = QAction("流程图", self)
         tb.addAction(self.act_diagram)
         tb.addSeparator()
 
-        self.act_add_station = QAction("新增岗位", self)
-        tb.addAction(self.act_add_station)
+        self.act_add_row = QAction("添加步骤", self)
+        self.act_del_row = QAction("删除步骤", self)
+        self.act_fill_sample = QAction("填入示例", self)
+        tb.addAction(self.act_add_row)
+        tb.addAction(self.act_del_row)
         tb.addSeparator()
-
-        self.act_edit_station = QAction("属性", self)
-        tb.addAction(self.act_edit_station)
-        tb.addSeparator()
+        tb.addAction(self.act_fill_sample)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -328,9 +90,18 @@ class ExportTicketWindow(QMainWindow):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
+        # ====== Tab 控件 ======
+        self.tabs = QTabWidget(self)
+        root.addWidget(self.tabs)
+
+        # ---------- Tab1：多车组合票 ----------
+        self.page_multi = QWidget(self)
+        page_multi_layout = QVBoxLayout(self.page_multi)
+        self.tabs.addTab(self.page_multi, "多工程组合票")
+
         # 参数区
         row_top = QHBoxLayout()
-        root.addLayout(row_top)
+        page_multi_layout.addLayout(row_top)
 
         row_top.addWidget(QLabel("工程名称："))
         self.ed_project = QLineEdit()
@@ -361,73 +132,111 @@ class ExportTicketWindow(QMainWindow):
 
         row_top.addStretch()
 
-        # 步骤表：新增“节拍时间(秒，可选)”和“起始需等区域ID(可选)”和“填充颜色(可选)”
-        self.tbl = QTableWidget(0, 10, self)
+        # 步骤表：新增“起始需等区域ID(可选)”和“填充颜色(可选)”
+        self.tbl = QTableWidget(0, 9, self)
         self.tbl.setHorizontalHeaderLabels([
             "序号", "工序显示名", "工位组名", "并行能力",
-            "时长(秒，逗号分隔表示多台)", "节拍时间(秒，可选)", "区域ID(可选)", "区域容量(可选)",
+            "时长(秒，逗号分隔表示多台)", "区域ID(可选)", "区域容量(可选)",
             "起始需等区域ID(可选)", "填充颜色(可选)"
         ])
         self.tbl.horizontalHeader().setStretchLastSection(True)
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setColumnWidth(self.COL_COLOR, 40)
-        # 只读预览，由「新增岗位 / 属性」统一入口编辑
-        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
-        self.tbl.setVisible(False)  # 数据源保留，但不显示
-        self.view = QGraphicsView(self)
-        self.view.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
-        root.addWidget(self.view, 1)
+        page_multi_layout.addWidget(self.tbl, 1)
 
         # 底部导出按钮栏
         btn_bar = QHBoxLayout()
-        root.addLayout(btn_bar)
+        page_multi_layout.addLayout(btn_bar)
         btn_bar.addStretch()
         self.btn_export = QPushButton("生成并导出组合票")
         btn_bar.addWidget(self.btn_export)
+
+        # ---------- Tab2：单工程组合票 ----------
+        self.page_single = QWidget(self)
+        page_single_layout = QVBoxLayout(self.page_single)
+        page_single_layout.setContentsMargins(8, 8, 8, 8)
+        page_single_layout.setSpacing(8)
+
+        # 顶部基本信息
+        row_info = QHBoxLayout()
+        page_single_layout.addLayout(row_info)
+
+        row_info.addWidget(QLabel("工程名称："))
+        self.ed_sw_project = QLineEdit(self.page_single)
+        self.ed_sw_project.setPlaceholderText("例如：前轴调整工位")
+        self.ed_sw_project.setFixedWidth(200)
+        row_info.addWidget(self.ed_sw_project)
+
+        row_info.addSpacing(12)
+        row_info.addWidget(QLabel("品番·品名："))
+        self.ed_sw_part = QLineEdit(self.page_single)
+        self.ed_sw_part.setPlaceholderText("例如：XXXX-XXXXX 前轮定位")
+        self.ed_sw_part.setFixedWidth(220)
+        row_info.addWidget(self.ed_sw_part)
+
+        row_info.addSpacing(12)
+        row_info.addWidget(QLabel("作业者："))
+        self.ed_sw_worker = QLineEdit(self.page_single)
+        self.ed_sw_worker.setPlaceholderText("例如：张三")
+        self.ed_sw_worker.setFixedWidth(120)
+        row_info.addWidget(self.ed_sw_worker)
+
+        row_info.addSpacing(12)
+        row_info.addWidget(QLabel("节拍TT(秒)："))
+        self.spn_sw_takt = QSpinBox(self.page_single)
+        self.spn_sw_takt.setRange(1, 9999)
+        self.spn_sw_takt.setValue(118)  # 默认示例
+        row_info.addWidget(self.spn_sw_takt)
+
+        row_info.addStretch()
+
+        # 作业手顺表（A→B 区间）
+        self.tbl_sw = QTableWidget(0, 7, self.page_single)
+        self.tbl_sw.setHorizontalHeaderLabels([
+            "顺序", "作业名称A", "作业名称B", "手作业(秒)", "自动(秒)", "步行(秒)", "步行在前/后"
+        ])
+        self.tbl_sw.horizontalHeader().setStretchLastSection(True)
+        self.tbl_sw.verticalHeader().setVisible(False)
+        page_single_layout.addWidget(self.tbl_sw, 1)
+
+        # 底部按钮栏（单工程组合票）
+        row_btn_sw = QHBoxLayout()
+        page_single_layout.addLayout(row_btn_sw)
+        row_btn_sw.addStretch()
+
+        self.btn_sw_add = QPushButton("添加作业行", self.page_single)
+        self.btn_sw_del = QPushButton("删除选中行", self.page_single)
+        self.btn_sw_export = QPushButton("导出标准作业组合票", self.page_single)
+
+        row_btn_sw.addWidget(self.btn_sw_add)
+        row_btn_sw.addWidget(self.btn_sw_del)
+        row_btn_sw.addWidget(self.btn_sw_export)
+
+        self.tabs.addTab(self.page_single, "单工程组合票")
 
         # 状态栏（用于显示导出进度 / 完成信息）
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
-        # 右侧：区域面板 Dock（针对本窗口表格做批量“节拍时间”设置）
-        if FEATURE_SHOW_AREA_PANEL:
-            self._area_panel = _ExportAreaPanel(self)
-            self.dock_area_panel = QDockWidget("区域面板", self)
-            self.dock_area_panel.setObjectName("dock_area_panel_export")
-            self.dock_area_panel.setWidget(self._area_panel)
-            self.dock_area_panel.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-            self.addDockWidget(Qt.RightDockWidgetArea, self.dock_area_panel)
-            # 初始构建一次区域列表
-            self._area_panel.rebuild_zones()
-
-        # 初始流程图渲染
-        self.refresh_diagram()
-
     def _connect_signals(self):
         self.act_back.triggered.connect(self.go_home)
+        self.act_add_row.triggered.connect(self.add_row)
+        self.act_del_row.triggered.connect(self.del_row)
+        self.act_fill_sample.triggered.connect(self.fill_sample)
         self.btn_export.clicked.connect(self.do_export)
-
+        self.act_help.triggered.connect(self.show_help)
         self.act_diagram.triggered.connect(self.show_diagram)
-        self.act_add_station.triggered.connect(self._open_add_workstation)
-        self.act_edit_station.triggered.connect(self._open_edit_properties)
 
-        # 双击或右键 -> 属性
-        self.tbl.cellDoubleClicked.connect(lambda *_: self._open_edit_properties())
-        self.tbl.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.tbl.customContextMenuRequested.connect(self._show_table_menu)
-        self.tbl.itemChanged.connect(lambda *_: self.refresh_diagram())
-        # 若区域面板存在（目前隐藏），保持同步
-        if hasattr(self, "_area_panel"):
-            self.tbl.itemChanged.connect(self._area_panel.on_table_changed)
-    def _show_table_menu(self, pos):
-        menu = QMenu(self)
-        act_prop = menu.addAction("属性")
-        act_prop.triggered.connect(self._open_edit_properties)
-        menu.exec(self.tbl.viewport().mapToGlobal(pos))
+        # Tab 切换时，控制顶部步骤按钮是否可用
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
+        # 单工程组合票 Tab
+        self.btn_sw_add.clicked.connect(self.add_single_row)
+        self.btn_sw_del.clicked.connect(self.del_single_row)
+        self.btn_sw_export.clicked.connect(self.export_single_placeholder)
 
-    # ------------- 动作 ------------- #
+    # ------------- 多车组合票：动作 ------------- #
     def add_row(self):
         r = self.tbl.rowCount()
         self.tbl.insertRow(r)
@@ -437,10 +246,9 @@ class ExportTicketWindow(QMainWindow):
         self.tbl.setItem(r, 2, QTableWidgetItem(""))
         self.tbl.setItem(r, 3, QTableWidgetItem("1"))
         self.tbl.setItem(r, 4, QTableWidgetItem(""))
-        self.tbl.setItem(r, 5, QTableWidgetItem(""))   # 节拍时间(秒，可选)
-        self.tbl.setItem(r, 6, QTableWidgetItem(""))   # 区域ID(可选)
-        self.tbl.setItem(r, 7, QTableWidgetItem(""))   # 区域容量(可选)
-        self.tbl.setItem(r, 8, QTableWidgetItem(""))   # 起始需等区域ID(可选)
+        self.tbl.setItem(r, 5, QTableWidgetItem(""))   # 区域ID(可选)
+        self.tbl.setItem(r, 6, QTableWidgetItem(""))   # 区域容量(可选)
+        self.tbl.setItem(r, 7, QTableWidgetItem(""))   # 起始需等区域ID(可选)
 
         color_btn = QPushButton("…")
         color_btn.setFixedSize(30, 22)
@@ -450,10 +258,6 @@ class ExportTicketWindow(QMainWindow):
         color_item.setData(Qt.UserRole, "")
         self.tbl.setItem(r, self.COL_COLOR, color_item)
 
-        self.refresh_diagram()
-        if hasattr(self, "_area_panel"):
-            self._area_panel.rebuild_zones()
-
     def _choose_color(self, row: int):
         dlg_col = QColorDialog.getColor(parent=self)
         if dlg_col.isValid():
@@ -461,173 +265,452 @@ class ExportTicketWindow(QMainWindow):
             btn = self.tbl.cellWidget(row, self.COL_COLOR)
             btn.setStyleSheet(f"background:{hex_code};")
             self.tbl.item(row, self.COL_COLOR).setData(Qt.UserRole, hex_code)
-        self.refresh_diagram()
-
-    def _prepare_color_cell(self, row, color_hex=None):
-        color_btn = QPushButton("…")
-        color_btn.setFixedSize(30, 22)
-        color_btn.clicked.connect(lambda _, r=row: self._choose_color(r))
-        self.tbl.setCellWidget(row, self.COL_COLOR, color_btn)
-        color_item = QTableWidgetItem("")
-        color_item.setData(Qt.UserRole, color_hex or "")
-        if color_hex:
-            color_btn.setStyleSheet(f"background:{color_hex};")
-        self.tbl.setItem(row, self.COL_COLOR, color_item)
-
-    # ---------- 新增岗位向导 ----------
-    def _open_add_workstation(self):
-        # 收集现有区域ID供下拉提示
-        zones = set()
-        for r in range(self.tbl.rowCount()):
-            item = self.tbl.item(r, self._col("区域ID") or 6)
-            zid = item.text().strip() if item else ""
-            if zid:
-                zones.add(zid)
-        try:
-            dlg = WorkstationDialog(self, sorted(zones))
-        except Exception:
-            # 回退（相对导入已在顶部处理）
-            dlg = WorkstationDialog(self, sorted(zones))
-        dlg.acceptedWithData.connect(self._insert_workstation_rows)
-        dlg.exec()
-
-    def _insert_workstation_rows(self, payload: dict):
-        """把“新增岗位”对话框数据，转为多行插入表格。"""
-        station_id = payload.get("station_id", "").strip()
-        display = payload.get("station_display", station_id)
-        zone_id = payload.get("zone_id", "").strip()
-        color_hex = payload.get("color") or ""
-        cycle = payload.get("cycle_time", None)
-        zone_cap = int(payload.get("zone_capacity") or 1)
-        steps = payload.get("steps") or []
-        gate = payload.get("gate")
-        insert = payload.get("insert") or {"mode": "append", "index": -1}
-
-        if not station_id or not zone_id or not steps:
-            return
-
-        table = self.tbl
-        # 计算插入位置
-        mode = insert.get("mode")
-        if mode == "before_selected":
-            row0 = table.currentRow()
-            if row0 < 0:
-                row0 = table.rowCount()
-        elif mode == "before_index":
-            try:
-                idx = int(insert.get("index", 1))
-            except Exception:
-                idx = 1
-            row0 = max(0, min(table.rowCount(), idx - 1))
-        else:
-            row0 = table.rowCount()
-
-        # 实际插入
-        for i, st in enumerate(steps):
-            table.insertRow(row0 + i)
-            # 准备颜色列
-            self._prepare_color_cell(row0 + i, color_hex if color_hex else None)
-
-            # 写入各列（用模糊列匹配，避免列顺序变化问题）
-            self._set_cell(row0 + i, "序号", "")  # 稍后统一重排
-            if i == 0:
-                # 若第一步在对话框里填写了名称，则优先使用；否则退回到岗位“显示名”
-                self._set_cell(row0 + i, "工序显示名", (st.get("name", "") or display))
-            else:
-                self._set_cell(row0 + i, "工序显示名", st.get("name", ""))
-            self._set_cell(row0 + i, "工位组名", station_id)
-            self._set_cell(row0 + i, "并行能力", str(zone_cap))
-
-            dur = st.get("duration", 0)
-            self._set_cell(row0 + i, "时长", str(dur))
-
-            if cycle not in (None, "", 0, 0.0):
-                self._set_cell(row0 + i, "节拍", str(cycle))
-
-            self._set_cell(row0 + i, "区域ID", zone_id)
-            self._set_cell(row0 + i, "区域容量", str(zone_cap))
-
-            if gate and gate.get("zone_id"):
-                self._set_cell(row0 + i, "起始需等区域ID", str(gate.get("zone_id")))
-                if gate.get("buffer"):
-                    # 目前界面没有单独列记录缓冲，保持在 tickets 里生效即可
-                    pass
-
-        # 统一重排“序号”列并选中首行
-        self._renumber_seq()
-        table.setCurrentCell(row0, self._col("工序显示名") or 1)
-        # 同步右侧区域面板
-        if hasattr(self, "_area_panel"):
-            self._area_panel.rebuild_zones()
-        # 刷新流程图
-        self.refresh_diagram()
-
-    # ==== 列定位/取写工具 ====
-    def _header_text(self, col: int) -> str:
-        item = self.tbl.horizontalHeaderItem(col)
-        return item.text() if item else ""
-
-    def _col(self, key_substr: str):
-        # 缓存首轮
-        if self._col_cache is None:
-            self._col_cache = {}
-            for c in range(self.tbl.columnCount()):
-                self._col_cache[self._header_text(c)] = c
-        for text, c in self._col_cache.items():
-            if key_substr in text:
-                return c
-        return None
-
-    def _set_cell(self, row: int, key_substr: str, val: str):
-        col = self._col(key_substr)
-        if col is None:
-            # 容错：若没找到，放弃本字段
-            return
-        item = self.tbl.item(row, col)
-        if item is None:
-            item = QTableWidgetItem()
-        item.setText(val)
-        self.tbl.setItem(row, col, item)
-
-    def _get_cell_text(self, row: int, key_substr: str) -> str:
-        col = self._col(key_substr)
-        if col is None:
-            return ""
-        it = self.tbl.item(row, col)
-        return it.text().strip() if it else ""
-
-    def _renumber_seq(self):
-        col = self._col("序号")
-        if col is None:
-            return
-        for r in range(self.tbl.rowCount()):
-            self.tbl.setItem(r, col, QTableWidgetItem(str(r + 1)))
 
     def del_row(self):
         r = self.tbl.currentRow()
         if r >= 0:
             self.tbl.removeRow(r)
-        self.refresh_diagram()
-        if hasattr(self, "_area_panel"):
-            self._area_panel.rebuild_zones()
 
+    # -------- 单人标准作业组合票：行操作 --------
+    def add_single_row(self):
+        """在单人作业手顺表中新增一行"""
+        if not hasattr(self, "tbl_sw"):
+            return
+        r = self.tbl_sw.rowCount()
+        self.tbl_sw.insertRow(r)
+        # 顺序默认递增（组合票行号）
+        self.tbl_sw.setItem(r, 0, QTableWidgetItem(str(r + 1)))
+        # 作业名称A / B 先留空，让你填写
+        self.tbl_sw.setItem(r, 1, QTableWidgetItem(""))
+        self.tbl_sw.setItem(r, 2, QTableWidgetItem(""))
+        # 手作业 / 自动 / 步行，默认 0
+        self.tbl_sw.setItem(r, 3, QTableWidgetItem("0"))
+        self.tbl_sw.setItem(r, 4, QTableWidgetItem("0"))
+        self.tbl_sw.setItem(r, 5, QTableWidgetItem("0"))
+        # 步行位置：默认“后置”
+        pos_cb = QComboBox(self.tbl_sw)
+        pos_cb.addItem("后置", userData="after")
+        pos_cb.addItem("前置", userData="before")
+        self.tbl_sw.setCellWidget(r, 6, pos_cb)
+
+    def del_single_row(self):
+        """删除单人作业手顺表中的选中行"""
+        if not hasattr(self, "tbl_sw"):
+            return
+        r = self.tbl_sw.currentRow()
+        if r >= 0:
+            self.tbl_sw.removeRow(r)
+        # 重写顺序列，让它保持 1,2,3,...
+        for i in range(self.tbl_sw.rowCount()):
+            item = self.tbl_sw.item(i, 0)
+            if item is None:
+                item = QTableWidgetItem()
+                self.tbl_sw.setItem(i, 0, item)
+            item.setText(str(i + 1))
+
+    # -------- 单人标准作业组合票：数据收集 --------
+    def _collect_single_inputs(self):
+        """
+        从单人作业手顺 Tab 中读取数据，并计算时间汇总。
+        返回：
+          project, part, worker, takt_sec, steps, totals
+        其中：
+          steps: [{seq, name, name_a, name_b, manual, auto, walk, walk_pos, duration, start, end}, ...]
+          totals: {"manual": x, "auto": y, "walk": z, "total": t}
+        """
+        if not hasattr(self, "tbl_sw"):
+            raise ValueError("单人作业手顺表尚未初始化")
+
+        project = (self.ed_sw_project.text().strip() or "工程")
+        part = self.ed_sw_part.text().strip()
+        worker = self.ed_sw_worker.text().strip()
+        takt_sec = int(self.spn_sw_takt.value())
+
+        steps = []
+        cur_time = 0.0
+        total_manual = 0.0
+        total_auto = 0.0
+        total_walk = 0.0
+
+        for r in range(self.tbl_sw.rowCount()):
+            # 作业名称 A / B
+            name_a_item = self.tbl_sw.item(r, 1)
+            name_b_item = self.tbl_sw.item(r, 2)
+            name_a = name_a_item.text().strip() if name_a_item else ""
+            name_b = name_b_item.text().strip() if name_b_item else ""
+
+            if not name_a and not name_b:
+                # 两个都没填，当作空行，跳过
+                continue
+
+            # 导出时使用的显示名（A→B / 单独一个）
+            if name_a and name_b:
+                name = f"{name_a} → {name_b}"
+            else:
+                name = name_a or name_b
+
+            def _get_time(col_idx: int) -> float:
+                item = self.tbl_sw.item(r, col_idx)
+                txt = item.text().strip() if item else ""
+                if not txt:
+                    return 0.0
+                try:
+                    return float(txt)
+                except Exception:
+                    raise ValueError(f"第 {r + 1} 行时间列（第 {col_idx + 1} 列）不是有效数字：{txt}")
+
+            # 手作业 / 自动 / 步行时间列：3, 4, 5
+            manual = _get_time(3)
+            auto = _get_time(4)
+            walk = _get_time(5)
+
+            # 步行位置：前置/后置（默认后置）
+            walk_pos = "after"
+            pos_widget = self.tbl_sw.cellWidget(r, 6)
+            if isinstance(pos_widget, QComboBox):
+                walk_pos_data = pos_widget.currentData()
+                if walk_pos_data in ("before", "after"):
+                    walk_pos = walk_pos_data
+
+            duration = manual + auto + walk
+            if duration <= 0:
+                raise ValueError(f"第 {r + 1} 行『{name}』的时间合计为 0，请填写手作业/自动/步行时间。")
+
+            start = cur_time
+            end = cur_time + duration
+            cur_time = end
+
+            total_manual += manual
+            total_auto += auto
+            total_walk += walk
+
+            # 顺序列（如果用户改过，我们尽量读取）
+            seq_item = self.tbl_sw.item(r, 0)
+            try:
+                seq = int(seq_item.text()) if seq_item and seq_item.text().strip() else len(steps) + 1
+            except Exception:
+                seq = len(steps) + 1
+
+            steps.append({
+                "seq": seq,
+                "name": name,       # A→B 组合显示名（保留）
+                "name_a": name_a,   # 原始作业名称A
+                "name_b": name_b,   # 原始作业名称B
+                "manual": manual,
+                "auto": auto,
+                "walk": walk,
+                "walk_pos": walk_pos,  # 步行在前/后
+                "duration": duration,
+                "start": start,
+                "end": end,
+            })
+
+        # 行数上限检查：防止超过模板预留的行数
+        if len(steps) > self.MAX_SINGLE_STEPS:
+            raise ValueError(
+                f"当前单人标准作业组合票共有 {len(steps)} 行，已超过模板最多支持的 {self.MAX_SINGLE_STEPS} 行。\n"
+                "请合并部分区间或拆分为多张组合票后再导出。"
+            )
+
+        if not steps:
+            raise ValueError("请至少填写一行有效的作业（需有作业名称和时间）。")
+
+        totals = {
+            "manual": total_manual,
+            "auto": total_auto,
+            "walk": total_walk,
+            "total": total_manual + total_auto + total_walk,
+        }
+        return project, part, worker, takt_sec, steps, totals
+
+    # -------- 单人标准作业组合票：写入模板 --------
+    def _export_single_to_excel(self, path, project, part, worker, takt_sec, steps, totals):
+        """
+        根据单人作业手顺（A→B 区间）将数据写入《组合票标准版.xlsx》模板：
+        - 模板文件需放在与本文件同一目录下，文件名：组合票标准版.xlsx
+        - 仅填充左侧步骤表区域和基本信息，不修改模板中的其他格式/图表
+        """
+        # 定位模板文件：与本 .py 同目录
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        template_path = os.path.join(base_dir, "组合票标准版.xlsx")
+        if not os.path.exists(template_path):
+            raise FileNotFoundError(f"未找到模板文件：{template_path}")
+
+        wb = load_workbook(template_path)
+        try:
+            ws = wb["④标准作业组合票"]
+        except KeyError:
+            ws = wb.active
+
+        def _set_value(coord, value):
+            """安全写入单元格：若目标是合并单元格，从其合并区域左上角写入"""
+            cell = ws[coord]
+            if isinstance(cell, MergedCell):
+                for mr in ws.merged_cells.ranges:
+                    if cell.coordinate in mr:
+                        ws.cell(row=mr.min_row, column=mr.min_col).value = value
+                        break
+            else:
+                cell.value = value
+
+        def _set_fill(row, col, fill):
+            """安全设置单元格填充：若目标是合并单元格，则写到其合并区域左上角"""
+            cell = ws.cell(row=row, column=col)
+            if isinstance(cell, MergedCell):
+                for mr in ws.merged_cells.ranges:
+                    if cell.coordinate in mr:
+                        ws.cell(row=mr.min_row, column=mr.min_col).fill = fill
+                        break
+            else:
+                cell.fill = fill
+
+        def _set_border(row, col, border: Border):
+            """
+            安全设置单元格边框：若目标是合并单元格，则写到其合并区域左上角；
+            与已有边框合并（只改指定方向的线型）。
+            """
+            cell = ws.cell(row=row, column=col)
+            if isinstance(cell, MergedCell):
+                for mr in ws.merged_cells.ranges:
+                    if cell.coordinate in mr:
+                        cell = ws.cell(row=mr.min_row, column=mr.min_col)
+                        break
+
+            old = cell.border or Border()
+
+            def merge_side(new_side, old_side):
+                if getattr(new_side, "style", None):
+                    return new_side
+                return old_side
+
+            cell.border = Border(
+                left=merge_side(border.left, old.left),
+                right=merge_side(border.right, old.right),
+                top=merge_side(border.top, old.top),
+                bottom=merge_side(border.bottom, old.bottom),
+                diagonal=old.diagonal,
+                diagonal_direction=old.diagonal_direction,
+                outline=old.outline,
+                vertical=old.vertical,
+                horizontal=old.horizontal,
+            )
+
+        # 1) 清空左侧原有数据区域
+        start_row = 9
+        row_span = 3
+        max_steps = getattr(self, "MAX_SINGLE_STEPS", 40)
+        end_row = start_row + max_steps * row_span - 1
+        for row in range(start_row, end_row + 1):
+            for col in range(1, 6):
+                cell = ws.cell(row=row, column=col)
+                if isinstance(cell, MergedCell):
+                    continue
+                cell.value = None
+
+        # 清空右侧时间轴区域填充（F列开始，按总时间估算范围）
+        time_start_col = 6  # F列
+        max_time = int(round(totals.get("total", 0))) if isinstance(totals, dict) else 0
+        if max_time < 0:
+            max_time = 0
+        time_end_col = time_start_col + max_time + 5
+        for row in range(start_row, end_row + 1):
+            for col in range(time_start_col, time_end_col + 1):
+                cell = ws.cell(row=row, column=col)
+                if isinstance(cell, MergedCell):
+                    continue
+                cell.fill = PatternFill()
+
+        # 2) 写入步骤：每步占 3 行（A9:A11, A12:A14, ...）
+        row_span = 3
+        time_start_col = 6  # F列
+        time_fill = PatternFill(fill_type="solid", fgColor="000000")
+        bars = []  # 记录每个黑条，用于画连线
+
+        for idx, s in enumerate(steps):
+            base_row = start_row + idx * row_span
+
+            # 序号
+            ws.cell(row=base_row, column=1).value = s["seq"]
+
+            # 作业名称 A/B：B 列两行
+            name_a = s.get("name_a") or s.get("name") or ""
+            name_b = s.get("name_b") or ""
+            ws.cell(row=base_row, column=2).value = name_a
+            if name_b:
+                ws.cell(row=base_row + 2, column=2).value = name_b
+
+            # 时间数值（C~E）
+            ws.cell(row=base_row, column=3).value = s["manual"]
+            ws.cell(row=base_row, column=4).value = s["auto"]
+            ws.cell(row=base_row, column=5).value = s["walk"]
+
+            # 时间条（手+自，步行空白）
+            start_sec = int(round(s["start"]))
+            manual_auto = float(s["manual"]) + float(s["auto"])
+            walk = float(s["walk"])
+            walk_pos = s.get("walk_pos", "after")
+
+            if walk_pos == "before":
+                bar_start_sec = int(round(start_sec + walk))
+            else:
+                bar_start_sec = start_sec
+
+            bar_end_sec = int(round(bar_start_sec + manual_auto))
+
+            if bar_end_sec > bar_start_sec:
+                mid_row = base_row + 1
+                for sec in range(bar_start_sec, bar_end_sec):
+                    col = time_start_col + sec
+                    _set_fill(mid_row, col, time_fill)
+
+                bars.append(
+                    {
+                        "mid_row": mid_row,
+                        "bar_start": bar_start_sec,
+                        "bar_end": bar_end_sec,
+                    }
+                )
+
+        # 2.5) 相邻黑条之间画连接线：
+        #      - 有间隔：步行 → 虚折线，从黑条末端下端开始，先竖后横（形状参考样本图）
+        #      - 无间隔：直接接续 → 加粗实直线
+        if len(bars) >= 2:
+            # 线条加粗一些，效果更明显
+            solid_side = Side(style="medium", color="000000")        # 加粗实线
+            walk_side = Side(style="mediumDashed", color="000000")   # 加粗虚线
+
+            h_walk_border = Border(top=walk_side)    # 水平虚线
+            v_walk_border = Border(left=walk_side)   # 垂直虚线
+            v_solid_border = Border(left=solid_side) # 垂直实线
+
+            for i in range(len(bars) - 1):
+                curr = bars[i]
+                nxt = bars[i + 1]
+
+                mid_row_curr = curr["mid_row"]     # 当前黑条所在行（块中间行）
+                mid_row_nxt = nxt["mid_row"]       # 下一黑条所在行
+                bar_end_curr = curr["bar_end"]
+                bar_start_nxt = nxt["bar_start"]
+
+                # 黑条最后一格所在的列（注意 bar_end 是“结束时间”，最后一格是 bar_end-1）
+                col_end_prev = time_start_col + bar_end_curr - 1
+                col_start_next = time_start_col + bar_start_nxt
+
+                if bar_start_nxt > bar_end_curr:
+                    # 有间隔：步行 → 虚折线
+                    # 右侧连接列：在黑条的“右边一格”开始
+                    col_conn = time_start_col + bar_end_curr       # 黑条最后一格的右侧列
+                    col_start_next = time_start_col + bar_start_nxt
+
+                    # 1) 竖虚线：从当前黑条的下沿(mid_row_curr+1) 到「下一条黑条的上一行(mid_row_nxt-1)」
+                    row_vert_start = mid_row_curr + 1
+                    row_vert_end = mid_row_nxt - 1
+                    if row_vert_start <= row_vert_end:
+                        for row in range(row_vert_start, row_vert_end + 1):
+                            _set_border(row, col_conn, v_walk_border)
+
+                    # 2) 水平虚线：在下一条黑条所在行，从竖线落点一直画到下一条黑条起点前一格
+                    #    即 [col_conn, col_start_next-1]，注意 range 右开区间
+                    for col in range(col_conn, col_start_next):
+                        _set_border(mid_row_nxt, col, h_walk_border)
+                else:
+                    # 无间隔或略微重叠：视为直接接续 → 加粗实直线
+                    # 连接列选在“前一条最后一格”和“下一条开始”的较大值所在列
+                    col = time_start_col + max(bar_end_curr - 1, bar_start_nxt)
+                    row_top = min(mid_row_curr, mid_row_nxt)
+                    row_bottom = max(mid_row_curr, mid_row_nxt)
+                    for row in range(row_top, row_bottom + 1):
+                        _set_border(row, col, v_solid_border)
+
+        # 3) 合计行：B49 总时间，C49 手作业总时间，D49 自动总时间，E49 步行总时间
+        if isinstance(totals, dict):
+            total_sec = totals.get("total", 0.0)
+            manual_sec = totals.get("manual", 0.0)
+            auto_sec = totals.get("auto", 0.0)
+            walk_sec = totals.get("walk", 0.0)
+        else:
+            total_sec = manual_sec = auto_sec = walk_sec = 0.0
+
+        def _fmt_sec(v):
+            """把秒数统一转成整数秒写入单元格"""
+            try:
+                return int(round(float(v)))
+            except Exception:
+                return v
+
+        _set_value("B49", _fmt_sec(total_sec))   # 合计下面：总时间
+        _set_value("C49", _fmt_sec(manual_sec))  # 手作业合计
+        _set_value("D49", _fmt_sec(auto_sec))    # 自动合计
+        _set_value("E49", _fmt_sec(walk_sec))    # 步行合计
+
+        # 4) 在上方空白处写入工程信息
+        _set_value("B2", project)
+        _set_value("B3", part)
+        _set_value("B4", worker)
+        _set_value("E2", takt_sec)
+
+        # 5) 保存
+        wb.save(path)
+
+    def export_single_placeholder(self):
+        """
+        单工程组合票导出流程：
+        1. 读取 Tab2 中 A→B 区间作业数据并校验
+        2. 选择保存路径
+        3. 使用固定 Excel 模板导出标准作业组合票
+        """
+        try:
+            project, part, worker, takt_sec, steps, totals = self._collect_single_inputs()
+        except Exception as e:
+            QMessageBox.warning(self, "输入有误", str(e))
+            return
+
+        default_name = f"{project}_单人组合票.xlsx" if project else "单人组合票.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出标准作业组合票",
+            default_name,
+            "Excel (*.xlsx)",
+        )
+        if not path:
+            return
+
+        try:
+            self._export_single_to_excel(path, project, part, worker, takt_sec, steps, totals)
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+            return
+
+        msg = (
+            f"已导出标准作业组合票：\n{path}\n\n"
+            f"工程名称：{project}\n"
+            f"品番·品名：{part or '（未填写）'}\n"
+            f"作业者：{worker or '（未填写）'}\n\n"
+            f"节拍 TT：{takt_sec} 秒\n"
+            f"总时间：{totals['total']:.1f} 秒\n"
+            f"  其中 手作业：{totals['manual']:.1f} 秒\n"
+            f"       自动：{totals['auto']:.1f} 秒\n"
+            f"       步行：{totals['walk']:.1f} 秒\n\n"
+            f"步骤数：{len(steps)} 步"
+        )
+        QMessageBox.information(self, "单工程组合票 - 导出完成", msg)
+
+    # -------- 多车组合票：数据收集 & 导出 --------
     def fill_sample(self):
         """
-        串行示例 + 阻塞区域 + 上游闸门：
-        - Z1: [电检2] ~ [NDA圈内] 属于同一区域，容量=1
-        - L2++ / 电检准备：起始需等区域ID = Z1  （即：开工前要等 Z1 有空位）
+        串行示例 + 阻塞区域 + 上游闸门 示例
         """
         self.tbl.setRowCount(0)
         sample_rows = [
-            # 序号, 显示名,   组,       能力, 时长, 节拍时间, 区域ID, 容量, 起始需等区域
-            ("1",  "L2++",   "L2++",   "1", "112", "", "",   "",   "Z1"),
-            ("2",  "电检准备", "电检准备", "1", "39.5", "", "",   "",   "Z1"),
-            ("3",  "电检1",   "电检",   "1", "80",  "", "",   "",   ""),   # 普通工位
-            ("4",  "电检2",   "电检",   "1", "70",  "", "Z1", "1", ""),   # 区域入口
-            ("5",  "电检结束", "电检结束", "1", "29.5","", "Z1", "",  ""),   # 区域内
-            ("6",  "NDA圈外", "NDA外",   "1", "30",  "", "Z1", "",  ""),   # 区域内
-            ("7",  "NDA圈内", "NDA内",   "1", "20",  "", "Z1", "",  ""),   # 区域出口
-            ("8",  "NDA检查", "NDA检查", "1", "30",  "", "",   "",   ""),   # 区域外
+            # 序号, 显示名,   组,       能力, 时长,   区域ID, 容量, 起始需等区域
+            ("1",  "L2++",   "L2++",   "1", "112", "",   "",   "Z1"),
+            ("2",  "电检准备", "电检准备", "1", "39.5", "",   "",   "Z1"),
+            ("3",  "电检1",   "电检",   "1", "80",  "",   "",   ""),   # 普通工位
+            ("4",  "电检2",   "电检",   "1", "70",  "Z1", "1", ""),   # 区域入口
+            ("5",  "电检结束", "电检结束", "1", "29.5","Z1", "",  ""),   # 区域内
+            ("6",  "NDA圈外", "NDA外",   "1", "30",  "Z1", "",  ""),   # 区域内
+            ("7",  "NDA圈内", "NDA内",   "1", "20",  "Z1", "",  ""),   # 区域出口
+            ("8",  "NDA检查", "NDA检查", "1", "30",  "",   "",   ""),   # 区域外
         ]
         for row in sample_rows:
             self.add_row()
@@ -640,9 +723,6 @@ class ExportTicketWindow(QMainWindow):
         self.spn_cars.setValue(4)
         self.cmb_grid.setCurrentText("1.0")
         self.cmb_wait.setCurrentText("开始前等待")
-        self.refresh_diagram()
-        if hasattr(self, "_area_panel"):
-            self._area_panel.rebuild_zones()
 
     def _collect_inputs(self):
         project = self.ed_project.text().strip() or "工程"
@@ -659,13 +739,12 @@ class ExportTicketWindow(QMainWindow):
         for r in range(self.tbl.rowCount()):
             seq = (self.tbl.item(r, 0).text().strip() if self.tbl.item(r, 0) else "")
             name = (self.tbl.item(r, 1).text().strip() if self.tbl.item(r, 1) else "")
-            grp  = (self.tbl.item(r, 2).text().strip() if self.tbl.item(r, 2) else "")
-            cap  = (self.tbl.item(r, 3).text().strip() if self.tbl.item(r, 3) else "1")
-            dur  = (self.tbl.item(r, 4).text().strip() if self.tbl.item(r, 4) else "")
-            cycle_time = (self.tbl.item(r, 5).text().strip() if self.tbl.item(r, 5) else "")
-            zid  = (self.tbl.item(r, 6).text().strip() if self.tbl.item(r, 6) else "")
-            zcap = (self.tbl.item(r, 7).text().strip() if self.tbl.item(r, 7) else "")
-            gzd  = (self.tbl.item(r, 8).text().strip() if self.tbl.item(r, 8) else "")
+            grp = (self.tbl.item(r, 2).text().strip() if self.tbl.item(r, 2) else "")
+            cap = (self.tbl.item(r, 3).text().strip() if self.tbl.item(r, 3) else "1")
+            dur = (self.tbl.item(r, 4).text().strip() if self.tbl.item(r, 4) else "")
+            zid = (self.tbl.item(r, 5).text().strip() if self.tbl.item(r, 5) else "")
+            zcap = (self.tbl.item(r, 6).text().strip() if self.tbl.item(r, 6) else "")
+            gzd = (self.tbl.item(r, 7).text().strip() if self.tbl.item(r, 7) else "")
             color_hex = self.tbl.item(r, self.COL_COLOR).data(Qt.UserRole) or ""
 
             if not name or not grp or not dur:
@@ -697,12 +776,6 @@ class ExportTicketWindow(QMainWindow):
                 "color": color_hex,
             }
 
-            if cycle_time:
-                try:
-                    rec["cycle_time"] = float(cycle_time)
-                except Exception:
-                    pass
-
             if zid:
                 rec["zone_id"] = zid
                 try:
@@ -728,14 +801,19 @@ class ExportTicketWindow(QMainWindow):
             QMessageBox.warning(self, "输入有误", str(e))
             return
 
-        path, _ = QFileDialog.getSaveFileName(self, "导出位置", f"{project}_组合票.xlsx", "Excel (*.xlsx)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出位置",
+            f"{project}_组合票.xlsx",
+            "Excel (*.xlsx)",
+        )
         if not path:
             return
         self.dst_path = path
 
         worker = Worker(
             tickets.schedule_and_export,
-            defs, cars, grid_step, wait_policy, project, self.dst_path
+            defs, cars, grid_step, wait_policy, project, self.dst_path,
         )
         worker.signals.error.connect(self._on_error)
         worker.signals.finished.connect(self._on_export_finished)
@@ -772,293 +850,15 @@ class ExportTicketWindow(QMainWindow):
 
     # ---------- 流程图弹窗 ----------
     def show_diagram(self):
-        """弹出流程图：用 FlowView 以“框+箭头”展示，并支持双击打开属性。"""
-        defs = self._collect_defs_for_flow()
-        if not defs:
-            QMessageBox.information(self, "提示", "请先录入步骤")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("流程图")
-        dlg.resize(960, 420)
-        lay = QVBoxLayout(dlg)
-
-        view = FlowView(dlg)
-        lay.addWidget(view)
-        view.render(defs)
-
-        # 在流程图里双击岗位框 -> 打开对应组的属性编辑
-        view.editRequested.connect(self._open_properties_for_group)
-
-        dlg.exec()
-    def _collect_defs_for_flow(self):
-        """把表格转换为 FlowView 所需的最小字段列表。"""
-        defs = []
-        for r in range(self.tbl.rowCount()):
-            name = self._get_cell_text(r, "工序显示名")
-            grp  = self._get_cell_text(r, "工位组名") or name
-            dur_txt = self._get_cell_text(r, "时长")
-            color_hex = ""
-            item_col = self.tbl.item(r, self.COL_COLOR)
-            if item_col is not None:
-                color_hex = item_col.data(Qt.UserRole) or ""
-
-            if not name or not dur_txt:
-                continue
-            # 取第一个时长作为可视化用
-            try:
-                first = str(dur_txt).replace("，", ",").split(",")[0].strip()
-                dur = float(first)
-            except Exception:
-                dur = 0.0
-            defs.append({
-                "display": name,
-                "group": grp,
-                "durations": [dur],
-                "color": color_hex,
-            })
-        return defs
-
-    def _open_properties_for_group(self, group_id: str):
-        """根据岗位组名在表格中定位并打开属性编辑。"""
-        for r in range(self.tbl.rowCount()):
-            if self._get_cell_text(r, "工位组名") == group_id:
-                self.tbl.selectRow(r)
-                self._open_edit_properties()
-                return
-        QMessageBox.information(self, "提示", f"未找到组：{group_id}")
-
-    # ---------- 串联示意图 ---------- #
-    def _draw_blocks(self, scene: QGraphicsScene, steps):
-        x, y = 0.0, 0.0
-        h, w, gap = 32, 110, 22
-        pen = QPen(Qt.black, 1)
-        zone_cache = {}
-        for idx, s in enumerate(steps):
-            # 决定颜色：自选 > 同区
-            col = s["color"] if s["color"] else zone_cache.get(s["zone"], "#90a4ae")
-            if s["zone"] and s["zone"] not in zone_cache:
-                zone_cache[s["zone"]] = col
-
-            rect = QGraphicsRectItem(x, y, w, h)
-            rect.setBrush(QBrush(QColor(col)))
-            rect.setPen(pen)
-            rect.setData(0, s["row"])
-            rect.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
-            scene.addItem(rect)
-
-            # 并行能力：右上角 ×N 角标（cap > 1 显示）
-            cap_val = max(1, int(s.get("cap", 1) or 1))
-            if cap_val > 1:
-                badge = QGraphicsTextItem(f"×{cap_val}")
-                badge.setDefaultTextColor(Qt.black)
-                badge.setPos(x + w - 26, y - 10)
-                scene.addItem(badge)
-
-            # 标题
-            txt = QGraphicsTextItem(s["name"])
-            txt.setDefaultTextColor(Qt.black)
-            txt.setPos(x + 4, y + 4)
-            scene.addItem(txt)
-
-            # 区域ID：右下角小标签（如 Z1）
-            if s.get("zone"):
-                ztag = QGraphicsTextItem(f"{s['zone']}")
-                ztag.setDefaultTextColor(QColor("#333333"))
-                ztag.setPos(x + w - 28, y + h - 18)
-                scene.addItem(ztag)
-
-            # 闸门：显式→红色；自动推断→灰色
-            gate_zone = s.get("gate") or ""
-            gate_color = Qt.red
-            if not gate_zone:
-                gate_zone = s.get("gate_auto") or ""
-                gate_color = QColor("#888888")
-            if gate_zone:
-                gate_txt = QGraphicsTextItem(f"⛔{gate_zone}")
-                gate_txt.setDefaultTextColor(gate_color)
-                gate_txt.setPos(x - 28, y - 10)   # 左上角外侧
-                scene.addItem(gate_txt)
-
-            # 连线 + 箭头
-            if idx < len(steps) - 1:
-                line = QGraphicsLineItem(x + w, y + h / 2, x + w + gap, y + h / 2)
-                line.setPen(pen)
-                scene.addItem(line)
-                path = QPainterPath()
-                path.moveTo(QPointF(x + w + gap, y + h / 2))
-                path.lineTo(QPointF(x + w + gap - 6, y + h / 2 - 4))
-                path.lineTo(QPointF(x + w + gap - 6, y + h / 2 + 4))
-                path.closeSubpath()
-                scene.addPath(path, pen, QBrush(Qt.black))
-
-            # 点击选择行 / 双击打开属性
-            def make_cb(row_idx):
-                return lambda _: self.tbl.selectRow(row_idx)
-            rect.mousePressEvent = make_cb(s["row"])
-
-            def make_dbl_cb(row_idx):
-                def _dbl(ev):
-                    self.tbl.selectRow(row_idx)
-                    self._open_edit_properties()
-                return _dbl
-            rect.mouseDoubleClickEvent = make_dbl_cb(s["row"])
-
-            x += w + gap
-
-    def refresh_diagram(self):
-        """根据表格内容重绘中央流程图"""
+        """弹出彩色流程图对话框"""
         steps = []
         for r in range(self.tbl.rowCount()):
-            name_item = self.tbl.item(r, 1)   # 工序显示名
-            zone_item = self.tbl.item(r, 6)   # 区域ID(可选)
-            gate_item = self.tbl.item(r, 8)   # 起始需等区域ID(可选)
-            name = name_item.text().strip() if name_item else ""
-            zone = zone_item.text().strip() if zone_item else ""
-            gate = gate_item.text().strip() if gate_item else ""
-            color_hex = ""
-            color_it = self.tbl.item(r, self.COL_COLOR)
-            if color_it is not None:
-                color_hex = color_it.data(Qt.UserRole) or ""
-            # 并行能力（默认1）
-            cap_val = 1
-            cap_item = self.tbl.item(r, 3)  # “并行能力”列
-            try:
-                cap_val = int(float(cap_item.text().strip())) if cap_item and cap_item.text().strip() else 1
-                if cap_val < 1:
-                    cap_val = 1
-            except Exception:
-                cap_val = 1
-
+            name = (self.tbl.item(r, 1).text().strip() if self.tbl.item(r, 1) else "")
+            zone = (self.tbl.item(r, 5).text().strip() if self.tbl.item(r, 5) else "")
+            gate = (self.tbl.item(r, 7).text().strip() if self.tbl.item(r, 7) else "")
+            color = self.tbl.item(r, self.COL_COLOR).data(Qt.UserRole) or "#b0bec5"
             if name:
-                steps.append({
-                    "row": r,
-                    "name": name,
-                    "zone": zone,
-                    "gate": gate,
-                    "cap": cap_val,
-                    "color": color_hex or "#b0bec5",
-                })
-        # 如果最后一个结点是“结束”且它并非来自表格（防御性处理），去掉它
-        if steps and steps[-1]["name"] == "结束":
-            real_exist = False
-            for r in range(self.tbl.rowCount()):
-                if self._get_cell_text(r, "工序显示名") == "结束":
-                    real_exist = True
-                    break
-            if not real_exist:
-                steps.pop()
-
-        # —— 自动判定：建议闸门 gate_auto（灰色提示）——
-        # 规则：对“自己无 zone 且未显式 gate”的步骤，寻找**后续的第一个区域入口**，作为 gate_auto。
-        def is_zone_entry(lst, idx):
-            return lst[idx]["zone"] and (idx == 0 or lst[idx-1]["zone"] != lst[idx]["zone"])
-
-        for i in range(len(steps)):
-            steps[i]["gate_auto"] = ""
-        for i in range(len(steps)):
-            if steps[i]["zone"] or steps[i]["gate"]:
-                continue  # 已在区域内或已显式闸门，不再自动提示
-            for j in range(i + 1, len(steps)):
-                if is_zone_entry(steps, j):
-                    steps[i]["gate_auto"] = steps[j]["zone"]
-                    break
-
-        scene = QGraphicsScene(self.view)
-        self._draw_blocks(scene, steps)
-        self.view.setScene(scene)
-        self.view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
-
-    def _on_error(self, tb: str):
-        QMessageBox.critical(self, "出错了", tb)
-        self.status.showMessage("发生错误", 6000)
-    # ===== 岗位属性编辑 =====
-    def _open_edit_properties(self):
-        row = self.tbl.currentRow()
-        if row < 0:
-            QMessageBox.information(self, "提示", "请先选中任意一个步骤所在行，再点击『属性』。")
-            return
-
-        payload, block_rows = self._collect_station_payload_at(row)
-        if not payload or not block_rows:
-            QMessageBox.warning(self, "提示", "未能识别当前行所属的岗位块。请确认该行已填写『工位组名』。")
-            return
-
-        dlg = StationPropertiesDialog(self, payload)
-        if dlg.exec() != QDialog.Accepted:
-            return
-
-        new_payload = dlg.payload()
-        insert_before_index = block_rows[0] + 1   # 保留原位置
-        new_payload["insert"] = {"mode": "before_index", "index": insert_before_index}
-
-        # 删除旧块（从下往上删）
-        for r in sorted(block_rows, reverse=True):
-            self.tbl.removeRow(r)
-
-        # 复用“新增岗位”插入逻辑
-        self._insert_workstation_rows(new_payload)
-        self._renumber_seq()
-        # 修改后刷新流程图
-        self.refresh_diagram()
-
-    def _collect_station_payload_at(self, any_row: int):
-        """
-        以 any_row 为中心，按『工位组名』向上/向下扩展，取得连续块，组装 payload。
-        返回 (payload: dict, block_rows: [int...])
-        """
-        col_grp = self._col("工位组名")
-        if col_grp is None:
-            return None, None
-        grp = self._get_cell_text(any_row, "工位组名")
-        if not grp:
-            return None, None
-
-        # 向上/下扩展
-        r0 = any_row
-        while r0 - 1 >= 0 and self._get_cell_text(r0 - 1, "工位组名") == grp:
-            r0 -= 1
-        r1 = any_row
-        while r1 + 1 < self.tbl.rowCount() and self._get_cell_text(r1 + 1, "工位组名") == grp:
-            r1 += 1
-        rows = list(range(r0, r1 + 1))
-        if not rows:
-            return None, None
-
-        # 公共属性（以首行为准）
-        display = self._get_cell_text(rows[0], "工序显示名") or grp
-        zone_id = self._get_cell_text(rows[0], "区域ID")
-        cycle_txt = self._get_cell_text(rows[0], "节拍时间")
-        gate_zone = self._get_cell_text(rows[0], "起始需等区域ID")
-        cap_txt = self._get_cell_text(rows[0], "区域容量") or self._get_cell_text(rows[0], "并行能力")
-
-        try: cap = max(1, int(float(cap_txt))) if cap_txt else 1
-        except Exception: cap = 1
-        try: cycle = float(cycle_txt) if cycle_txt else 0.0
-        except Exception: cycle = 0.0
-
-        color_hex = self.tbl.item(rows[0], self.COL_COLOR).data(Qt.UserRole) or ""
-
-        # 组装 steps（与现有行数对齐；第 1 行 name 可留空）
-        steps = []
-        for i, r in enumerate(rows):
-            name = self._get_cell_text(r, "工序显示名")
-            dur_txt = self._get_cell_text(r, "时长")
-            dur_val = 0.0
-            if dur_txt:
-                part = str(dur_txt).replace("，", ",").split(",")[0].strip()
-                try: dur_val = float(part)
-                except Exception: dur_val = 0.0
-            steps.append({"name": name, "duration": dur_val})
-
-        payload = {
-            "station_id": grp,
-            "station_display": display,
-            "zone_id": zone_id,
-            "color": color_hex,
-            "cycle_time": cycle,
-            "zone_capacity": cap,
-            "steps": steps,
-            "gate": {"zone_id": gate_zone} if gate_zone else {},
-        }
-        return payload, rows
+                steps.append({"row": r, "name": name, "zone": zone, "gate": gate, "color": color})
+        if not steps:
+            QMessageBox.information(self, "提示", "请先录入步骤")
+       
