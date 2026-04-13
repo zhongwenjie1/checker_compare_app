@@ -1,0 +1,5 @@
+PySide6==6.7.1         # 已有
+pandas>=2.2
+numpy>=2.0
+XlsxWriter>=3.2        # ← 加这一行
+openpyxl>=3.1          # fallback 仍保留
