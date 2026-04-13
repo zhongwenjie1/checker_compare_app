@@ -1,0 +1,46 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Test app import
+        run: |
+          python -c "import main; print('main import ok')"
+
+      - name: Build EXE
+        run: |
+          pyinstaller --noconfirm --windowed --name checker_compare_app --add-data "themes;themes" main.py
+
+      - name: Zip build output
+        run: |
+          powershell Compress-Archive -Path dist\checker_compare_app\* -DestinationPath dist\checker_compare_app_win.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checker_compare_app_win
+          path: dist/checker_compare_app_win.zip
+        
