@@ -32,7 +32,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --noconfirm --windowed --name checker_compare_app --add-data "themes;themes" main.py
+          pyinstaller --noconfirm --clean --windowed --name checker_compare_app --paths . --add-data "themes;themes" --collect-submodules ui --collect-submodules core --collect-submodules infra --collect-submodules models --collect-submodules utils main.py
 
       - name: Zip build output
         run: |
