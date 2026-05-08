@@ -1691,7 +1691,7 @@ class ExportTicketWindow(QMainWindow):
         - 实际下线节拍：按参与统计车辆的下线时间间隔平均值计算。
           1) 若真实实际下线台数 >= 计划下线台数：统计第1台到第计划下线台数台。
           2) 若真实实际下线台数 < 计划下线台数：统计第1台到最后一台实际下线车辆。
-        - 最终判定：真实实际下线台数 >= 计划下线台数 为 OK，否则 NG。
+        - 最终判定：真实实际下线台数达到计划下线台数，且实际下线节拍不大于目标节拍时为 OK，否则 NG。
         - 累计阻塞、超节拍工程只显示，不直接参与最终判定。
         """
         if not isinstance(analysis, dict):
@@ -1772,7 +1772,9 @@ class ExportTicketWindow(QMainWindow):
             else:
                 actual_production_takt = 0.0
 
-            final_result = "OK" if actual_output_count >= planned_output_count else "NG"
+            output_ok = actual_output_count >= planned_output_count
+            takt_ok = actual_production_takt <= float(target_takt) + 1e-9
+            final_result = "OK" if (output_ok and takt_ok) else "NG"
 
         summary.update({
             "analysis_time_seconds": analysis_time_seconds,
