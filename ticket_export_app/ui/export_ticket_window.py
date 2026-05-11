@@ -24,6 +24,7 @@ except Exception:
 from infra.threads import Worker
 from core import tickets
 from core.analysis import apply_time_window_analysis as core_apply_time_window_analysis
+from core.input_parser import parse_multi_project_inputs as core_parse_multi_project_inputs
 
 
 class ExportTicketWindow(QMainWindow):
@@ -1481,6 +1482,92 @@ class ExportTicketWindow(QMainWindow):
         self.cmb_launch_mode.setCurrentText("按数量投车")
         self.cmb_seq.setCurrentText("顺排(A→B→C)")
         self.spn_max_run.setValue(10)
+
+    def _collect_multi_raw_inputs(self):
+        """Collect multi-project UI values as plain data for later parser migration."""
+        project = self.ed_project.text().strip() or "工程"
+        cars_a = int(self.spn_a_cars.value())
+        cars_b = int(self.spn_b_cars.value())
+        cars_c = int(self.spn_c_cars.value())
+        analysis_minutes = int(self.spn_total_cars.value()) if hasattr(self, "spn_total_cars") else 0
+        target_takt = float(self.spn_target_takt.value()) if hasattr(self, "spn_target_takt") else 0.0
+        is_ratio_mode = self.cmb_launch_mode.currentIndex() == 1
+        sequence_mode_index = self.cmb_seq.currentIndex() if hasattr(self, "cmb_seq") else 0
+        max_consecutive = int(self.spn_max_run.value()) if hasattr(self, "spn_max_run") else 10
+
+        station_rows = []
+        for r in range(self.tbl.rowCount()):
+            seq = (self.tbl.item(r, 0).text().strip() if self.tbl.item(r, 0) else "")
+            name = (self.tbl.item(r, 1).text().strip() if self.tbl.item(r, 1) else "")
+
+            device_count_widget = self.tbl.cellWidget(r, 2)
+            device_count_text = device_count_widget.currentText().strip() if isinstance(device_count_widget, QComboBox) else "2"
+
+            line_scope_widget = self.tbl.cellWidget(r, 3)
+            line_scope = line_scope_widget.currentText().strip() if isinstance(line_scope_widget, QComboBox) else "双线"
+
+            grp = (self.tbl.item(r, 4).text().strip() if self.tbl.item(r, 4) else "")
+            dur_a = (self.tbl.item(r, 5).text().strip() if self.tbl.item(r, 5) else "")
+            dur_b = (self.tbl.item(r, 6).text().strip() if self.tbl.item(r, 6) else "")
+            dur_c = (self.tbl.item(r, 7).text().strip() if self.tbl.item(r, 7) else "")
+
+            station_rows.append({
+                "seq": seq,
+                "display": name,
+                "device_count": device_count_text,
+                "line_scope": line_scope,
+                "group": grp,
+                "duration_a": dur_a,
+                "duration_b": dur_b,
+                "duration_c": dur_c,
+                "color": "",
+            })
+
+        return {
+            "project": project,
+            "cars_a": cars_a,
+            "cars_b": cars_b,
+            "cars_c": cars_c,
+            "analysis_minutes": analysis_minutes,
+            "target_takt": target_takt,
+            "is_ratio_mode": is_ratio_mode,
+            "sequence_mode_index": sequence_mode_index,
+            "max_consecutive": max_consecutive,
+            "station_rows": station_rows,
+        }
+
+    def _parse_multi_inputs_from_raw(self):
+        """
+        通过 core.input_parser 解析多工程原始输入。
+        当前阶段仅作为后续替换 _collect_inputs() 的桥接函数。
+        暂不接入现有分析/导出流程。
+        """
+        raw_inputs = self._collect_multi_raw_inputs()
+        return core_parse_multi_project_inputs(raw_inputs)
+
+    def _collect_inputs_from_parser_tuple(self):
+        """
+        使用 core.input_parser 解析多工程输入，并转换为 _collect_inputs() 兼容的旧 tuple。
+        当前阶段仅作为后续替换 _collect_inputs() 的桥接函数。
+        暂不接入现有分析/导出流程。
+        """
+        parsed = self._parse_multi_inputs_from_raw()
+
+        self.current_analysis_time_seconds = parsed.get("analysis_time_seconds")
+        self.current_theoretical_launch_count = parsed.get("theoretical_launch_count")
+
+        return (
+            parsed["project"],
+            parsed["cars"],
+            parsed["grid_step"],
+            parsed["wait_policy"],
+            parsed["defs"],
+            parsed["vehicle_counts"],
+            parsed["sequence_mode"],
+            parsed["max_consecutive"],
+            parsed["ratio_pattern"],
+            parsed["target_takt"],
+        )
 
     def _collect_inputs(self):
         project = self.ed_project.text().strip() or "工程"
