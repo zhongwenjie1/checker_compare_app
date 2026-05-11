@@ -1688,10 +1688,8 @@ class ExportTicketWindow(QMainWindow):
         - 真实实际下线台数 = 分析时间内实际完成全部工程的车辆数量。
         - 显示实际下线台数 = min(真实实际下线台数, 计划下线台数)。
         - 达成率 = min(真实实际下线台数 / 计划下线台数, 100%)。
-        - 实际下线节拍：按参与统计车辆的下线时间间隔平均值计算。
-          1) 若真实实际下线台数 >= 计划下线台数：统计第1台到第计划下线台数台。
-          2) 若真实实际下线台数 < 计划下线台数：统计第1台到最后一台实际下线车辆。
-        - 最终判定：真实实际下线台数达到计划下线台数，且实际下线节拍不大于目标节拍时为 OK，否则 NG。
+        - 实际下线节拍 = 用计划第 N 台理论下线时间与实际第 N 台下线时间差异反推。
+        - 最终判定：真实实际下线台数达到计划下线台数，且实际第 N 台不晚于计划第 N 台时为 OK，否则 NG。
         - 累计阻塞、超节拍工程只显示，不直接参与最终判定。
         """
         if not isinstance(analysis, dict):
@@ -1721,10 +1719,12 @@ class ExportTicketWindow(QMainWindow):
             if car <= 0:
                 continue
 
-            try:
-                finish = float(row.get("depart", row.get("end", row.get("svc_finish", 0.0))) or 0.0)
-            except Exception:
-                finish = 0.0
+            finish = 0.0
+            for key in ("depart", "end", "svc_finish"):
+                try:
+                    finish = max(finish, float(row.get(key, 0.0) or 0.0))
+                except Exception:
+                    pass
 
             car_finish_times[car] = max(car_finish_times.get(car, 0.0), finish)
 
@@ -1736,12 +1736,12 @@ class ExportTicketWindow(QMainWindow):
         )
 
         station_count = max(1, len(station_names))
-        first_planned_output_time = station_count * float(target_takt)
-        if float(analysis_time_seconds) + 1e-9 < first_planned_output_time:
+        line_lead_time = station_count * float(target_takt)
+        if float(analysis_time_seconds) + 1e-9 < line_lead_time:
             planned_output_count = 0
         else:
             planned_output_count = math.floor(
-                (float(analysis_time_seconds) - first_planned_output_time) / float(target_takt)
+                (float(analysis_time_seconds) - line_lead_time) / float(target_takt)
             ) + 1
 
         if planned_output_count > 0:
@@ -1749,43 +1749,51 @@ class ExportTicketWindow(QMainWindow):
         else:
             display_actual_output_count = actual_output_count
 
+        planned_n_finish_time = None
+        actual_n_finish_time = None
+        finish_delta = None
+        actual_line_takt = None
+
         if planned_output_count <= 0:
             achievement_rate = 0.0
-            actual_production_takt = 0.0
-            final_result = "OK"
+            final_result = "未判定"
         else:
             achievement_rate = min(actual_output_count / planned_output_count, 1.0)
+            planned_n_finish_time = line_lead_time + (planned_output_count - 1) * float(target_takt)
 
-            # 新实际下线节拍算法
-            if actual_output_count >= planned_output_count and len(finish_times) >= planned_output_count:
-                counted_finish_times = finish_times[:planned_output_count]
+            if len(finish_times) >= planned_output_count:
+                actual_n_finish_time = finish_times[planned_output_count - 1]
+                finish_delta = actual_n_finish_time - planned_n_finish_time
+                if planned_output_count > 1:
+                    actual_line_takt = float(target_takt) + finish_delta / (planned_output_count - 1)
+                else:
+                    actual_line_takt = float(target_takt)
+
+            if actual_output_count < planned_output_count:
+                final_result = "NG"
+            elif actual_n_finish_time is None:
+                final_result = "NG"
+            elif actual_n_finish_time > planned_n_finish_time + 1e-9:
+                final_result = "NG"
             else:
-                counted_finish_times = [
-                    finish for finish in finish_times
-                    if finish <= float(analysis_time_seconds) + 1e-9
-                ]
-
-            if len(counted_finish_times) >= 2:
-                first_finish_time = counted_finish_times[0]
-                last_finish_time = counted_finish_times[-1]
-                actual_production_takt = (last_finish_time - first_finish_time) / (len(counted_finish_times) - 1)
-            else:
-                actual_production_takt = 0.0
-
-            output_ok = actual_output_count >= planned_output_count
-            takt_ok = actual_production_takt <= float(target_takt) + 1e-9
-            final_result = "OK" if (output_ok and takt_ok) else "NG"
+                final_result = "OK"
 
         summary.update({
             "analysis_time_seconds": analysis_time_seconds,
             "analysis_time_minutes": analysis_time_seconds / 60.0,
             "theoretical_launch_count": int(theoretical_launch_count),
+            "station_count": station_count,
+            "line_lead_time": line_lead_time,
             "planned_output_count_in_window": planned_output_count,
             "actual_output_count_in_window": actual_output_count,
             "display_actual_output_count_in_window": display_actual_output_count,
             "actual_equivalent_count_in_window": display_actual_output_count,
             "achievement_rate": achievement_rate,
-            "actual_production_takt_in_window": actual_production_takt,
+            "planned_n_finish_time": planned_n_finish_time,
+            "actual_n_finish_time": actual_n_finish_time,
+            "finish_delta": finish_delta,
+            "actual_line_takt_in_window": actual_line_takt,
+            "actual_production_takt_in_window": actual_line_takt,
             "time_window_result": final_result,
         })
 
@@ -1947,17 +1955,27 @@ class ExportTicketWindow(QMainWindow):
 
         actual_output_count = int(summary.get("actual_output_count_in_window", 0) or 0)
         planned_output_count = self._fmt_analysis_num(summary.get("planned_output_count_in_window", 0.0))
-        actual_equivalent_count = self._fmt_analysis_num(
-            summary.get(
-                "display_actual_output_count_in_window",
-                summary.get("actual_equivalent_count_in_window", 0.0)
-            )
-        )
         theoretical_launch_count = int(summary.get("theoretical_launch_count", total_cars) or total_cars)
         achievement_rate = float(summary.get("achievement_rate", 0.0) or 0.0) * 100
-        actual_takt_in_window = self._fmt_analysis_num(summary.get("actual_takt_in_window", 0.0))
-        actual_production_takt_in_window = self._fmt_analysis_num(summary.get("actual_production_takt_in_window", 0.0))
         target_takt_display = self._fmt_analysis_num(summary.get("target_takt", self.spn_target_takt.value() if hasattr(self, "spn_target_takt") else 0))
+
+        def _fmt_optional_seconds(value):
+            if value is None:
+                return "—"
+            return self._fmt_analysis_num(value)
+
+        planned_n_finish_time = _fmt_optional_seconds(summary.get("planned_n_finish_time"))
+        actual_n_finish_time = _fmt_optional_seconds(summary.get("actual_n_finish_time"))
+        finish_delta_raw = summary.get("finish_delta")
+        if finish_delta_raw is None:
+            finish_delta = "—"
+        else:
+            try:
+                finish_delta_num = float(finish_delta_raw)
+                finish_delta = f"{finish_delta_num:+.1f}" if abs(finish_delta_num - round(finish_delta_num)) >= 1e-9 else f"{int(round(finish_delta_num)):+d}"
+            except Exception:
+                finish_delta = str(finish_delta_raw)
+        actual_line_takt_in_window = _fmt_optional_seconds(summary.get("actual_line_takt_in_window"))
 
         is_ratio = hasattr(self, "cmb_launch_mode") and self.cmb_launch_mode.currentIndex() == 1
         if is_ratio:
@@ -1991,9 +2009,10 @@ class ExportTicketWindow(QMainWindow):
             right_html = (
                 "<b>模型判定</b><br>"
                 f"最终判定：{final_result}<br>"
-                f"下线达成：计划{planned_output_count}台｜实际{actual_equivalent_count}台｜达成率：{achievement_rate:.1f}%<br>"
-                f"节拍能力：实际下线节拍：{actual_production_takt_in_window}s/台｜目标节拍{target_takt_display}s/台<br>"
-                f"累计阻塞：{blocking_time}s｜超节拍工程：{process_root_text}"
+                f"下线达成：计划{planned_output_count}台｜实际{actual_output_count}台｜达成率{achievement_rate:.1f}%<br>"
+                f"计划完成：计划{planned_n_finish_time}s｜实际{actual_n_finish_time}s｜差异{finish_delta}s<br>"
+                f"实际下线节拍：{actual_line_takt_in_window}s/台｜目标{target_takt_display}s/台<br>"
+                f"阻塞分析：累计阻塞{blocking_time}s｜超节拍工程：{process_root_text}"
             )
         else:
             try:
