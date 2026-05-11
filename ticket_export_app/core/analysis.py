@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List
 
@@ -577,3 +578,136 @@ def analyze_schedule_v2(
         "car_type_summary": car_type_summary,
         "rows": rows,
     }
+
+
+def apply_time_window_analysis(
+    analysis,
+    rows,
+    target_takt,
+    analysis_time_seconds,
+    theoretical_launch_count,
+):
+    """Apply v2-6D line takt time-window analysis without touching scheduling."""
+    if not isinstance(analysis, dict):
+        return analysis
+
+    try:
+        analysis_time_seconds = float(analysis_time_seconds or 0.0)
+        theoretical_launch_count = int(theoretical_launch_count or 0)
+        target_takt = float(target_takt or 0.0)
+    except Exception:
+        return analysis
+
+    if not analysis_time_seconds or not theoretical_launch_count or target_takt <= 0:
+        return analysis
+
+    summary = analysis.setdefault("summary", {})
+
+    car_finish_times = {}
+    station_names = []
+    seen_stations = set()
+
+    for row in rows or []:
+        station = str(row.get("step_display", row.get("station", row.get("group", ""))) or "")
+        if station and station not in seen_stations:
+            station_names.append(station)
+            seen_stations.add(station)
+
+        try:
+            car = int(row.get("car", 0) or 0)
+        except Exception:
+            car = 0
+
+        if car <= 0:
+            continue
+
+        finish = 0.0
+        for key in ("depart", "end", "svc_finish"):
+            try:
+                finish = max(finish, float(row.get(key, 0.0) or 0.0))
+            except Exception:
+                pass
+
+        car_finish_times[car] = max(car_finish_times.get(car, 0.0), finish)
+
+    finish_times = sorted(car_finish_times.values())
+    actual_output_count = sum(
+        1 for finish in finish_times
+        if finish <= analysis_time_seconds + 1e-9
+    )
+
+    station_count = max(1, len(station_names))
+    line_lead_time = station_count * target_takt
+    if analysis_time_seconds + 1e-9 < line_lead_time:
+        planned_output_count = 0
+    else:
+        planned_output_count = math.floor(
+            (analysis_time_seconds - line_lead_time) / target_takt
+        ) + 1
+
+    display_actual_output_count = (
+        min(actual_output_count, planned_output_count)
+        if planned_output_count > 0
+        else actual_output_count
+    )
+
+    planned_n_finish_time = None
+    actual_n_finish_time = None
+    finish_delta = None
+    actual_line_takt = None
+
+    if planned_output_count <= 0:
+        achievement_rate = 0.0
+        final_result = "未判定"
+    else:
+        achievement_rate = min(actual_output_count / planned_output_count, 1.0)
+        planned_n_finish_time = line_lead_time + (planned_output_count - 1) * target_takt
+
+        if len(finish_times) >= planned_output_count:
+            actual_n_finish_time = finish_times[planned_output_count - 1]
+            finish_delta = actual_n_finish_time - planned_n_finish_time
+            if planned_output_count > 1:
+                actual_line_takt = target_takt + finish_delta / (planned_output_count - 1)
+            else:
+                actual_line_takt = target_takt
+
+        if actual_output_count < planned_output_count:
+            final_result = "NG"
+        elif actual_n_finish_time is None:
+            final_result = "NG"
+        elif actual_n_finish_time > planned_n_finish_time + 1e-9:
+            final_result = "NG"
+        else:
+            final_result = "OK"
+
+    summary.update({
+        "analysis_time_seconds": analysis_time_seconds,
+        "analysis_time_minutes": analysis_time_seconds / 60.0,
+        "theoretical_launch_count": theoretical_launch_count,
+        "station_count": station_count,
+        "line_lead_time": line_lead_time,
+        "planned_output_count_in_window": planned_output_count,
+        "actual_output_count_in_window": actual_output_count,
+        "display_actual_output_count_in_window": display_actual_output_count,
+        "actual_equivalent_count_in_window": display_actual_output_count,
+        "achievement_rate": achievement_rate,
+        "planned_n_finish_time": planned_n_finish_time,
+        "actual_n_finish_time": actual_n_finish_time,
+        "finish_delta": finish_delta,
+        "actual_line_takt_in_window": actual_line_takt,
+        "actual_production_takt_in_window": actual_line_takt,
+        "time_window_result": final_result,
+    })
+
+    summary.pop("ok_output_count_in_window", None)
+    summary.pop("output_gap_count", None)
+    summary.pop("output_gap_time", None)
+    summary.pop("actual_output_takt_in_window", None)
+    summary.pop("completed_step_count_in_window", None)
+    summary.pop("planned_step_count_in_window", None)
+    summary.pop("planned_equivalent_count_raw_in_window", None)
+    summary.pop("actual_equivalent_count_raw_in_window", None)
+    summary.pop("entered_step_count_in_window", None)
+    summary.pop("actual_takt_in_window", None)
+
+    return analysis
