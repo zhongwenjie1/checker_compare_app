@@ -1765,7 +1765,11 @@ class ExportTicketWindow(QMainWindow):
         time_window_result = summary.get("time_window_result", "") or ""
         final_result = time_window_result or "OK"
 
-        actual_output_count = int(summary.get("actual_output_count_in_window", 0) or 0)
+        actual_output_count_raw = int(summary.get("actual_output_count_in_window", 0) or 0)
+        display_actual_output_count = self._fmt_analysis_num(summary.get(
+            "display_actual_output_count_in_window",
+            actual_output_count_raw,
+        ))
         planned_output_count = self._fmt_analysis_num(summary.get("planned_output_count_in_window", 0.0))
         theoretical_launch_count = int(summary.get("theoretical_launch_count", total_cars) or total_cars)
         achievement_rate = float(summary.get("achievement_rate", 0.0) or 0.0) * 100
@@ -1821,7 +1825,7 @@ class ExportTicketWindow(QMainWindow):
             right_html = (
                 "<b>模型判定</b><br>"
                 f"最终判定：{final_result}<br>"
-                f"下线达成：计划{planned_output_count}台｜实际{actual_output_count}台｜达成率{achievement_rate:.1f}%<br>"
+                f"下线达成：计划{planned_output_count}台｜实际{display_actual_output_count}台｜达成率{achievement_rate:.1f}%<br>"
                 f"计划完成：计划{planned_n_finish_time}s｜实际{actual_n_finish_time}s｜差异{finish_delta}s<br>"
                 f"实际下线节拍：{actual_line_takt_in_window}s/台｜目标{target_takt_display}s/台<br>"
                 f"阻塞分析：累计阻塞{blocking_time}s｜超节拍工程：{process_root_text}"
