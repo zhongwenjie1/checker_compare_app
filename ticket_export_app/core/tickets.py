@@ -474,6 +474,21 @@ def schedule(step_defs: List[Dict[str, Any]],
             return float(st.get("duration_c", st["duration"]))
         return float(st.get("duration_a", st["duration"]))
 
+    def _find_next_effective_step(
+        all_steps: List[Dict[str, Any]],
+        current_index: int,
+        car_type: str,
+    ) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+        for next_index in range(current_index + 1, len(all_steps)):
+            next_step = all_steps[next_index]
+            try:
+                next_duration = float(_pick_duration(next_step, car_type) or 0.0)
+            except Exception:
+                next_duration = 0.0
+            if next_duration > 0:
+                return next_index, next_step
+        return None, None
+
     for car, car_type in enumerate(vehicle_seq, start=1):
         theory_launch_time = (car - 1) * launch_takt_value if launch_takt_value > 0 else 0.0
         prev_depart = theory_launch_time
@@ -536,11 +551,11 @@ def schedule(step_defs: List[Dict[str, Any]],
             svc_finish = start + cur_duration
 
             # ---- depart 受“下步可接收（服务器释放 + zone 容量）”约束 ----
-            if j < m - 1:
-                next_st = steps[j + 1]
+            next_idx, next_st = _find_next_effective_step(steps, j, car_type)
+            if next_st is not None and next_idx is not None:
                 next_key = str(next_st.get("resource_key", "") or "")
                 next_heap = resource_heaps[next_key]
-                next_upcoming_forced_line = _upcoming_forced_line(steps, j + 2, car_type)
+                next_upcoming_forced_line = _upcoming_forced_line(steps, next_idx + 1, car_type)
                 next_ready = _peek_resource_ready(
                     next_heap,
                     next_st,
@@ -549,8 +564,8 @@ def schedule(step_defs: List[Dict[str, Any]],
                 )
 
                 # 若“下步”是某 Zone 的入口，还得等该 Zone 出现名额
-                if is_zone_entry(j + 1):
-                    nzid = steps[j + 1]["zone_id"]
+                if is_zone_entry(next_idx):
+                    nzid = steps[next_idx]["zone_id"]
                     nheap = zone_heaps[nzid]
                     next_ready = max(next_ready, nheap[0] if nheap else 0.0)
 
