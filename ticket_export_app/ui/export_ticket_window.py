@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QApplication, QDialog, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QToolBar, QStatusBar, QMessageBox, QTableWidget,
     QTableWidgetItem, QSpinBox, QComboBox, QLineEdit, QColorDialog,
     QTabWidget, QFrame, QAbstractItemView, QHeaderView, QGraphicsScene, QGraphicsView, QProgressBar,
     QPlainTextEdit
 )
 from PySide6.QtCore import Qt, QThreadPool, QTimer
-from PySide6.QtGui import QAction, QColor, QPen, QBrush
+from PySide6.QtGui import QAction, QColor, QPen, QBrush, QFont
 import os
 import math
+from html import escape
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import PatternFill, Border, Side
@@ -44,7 +45,8 @@ class ExportTicketWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"导出组合票  v{__version__}")
-        self.resize(1120, 720)
+        self.resize(1180, 760)
+        self.setMinimumSize(1080, 700)
 
         self.thread_pool = QThreadPool.globalInstance()
         self.dst_path = None
@@ -320,42 +322,14 @@ class ExportTicketWindow(QMainWindow):
         self.tbl_station_analysis.setAlternatingRowColors(True)
         self.tbl_station_analysis.hide()
 
-        # 车型数据摘要区：作为后续完整动画仿真的前置展示层
+        # 车型数据摘要区：只承载基础排程摘要与模型结果。
         vehicle_summary_frame, vehicle_summary_layout = _make_block("车型数据摘要区")
-        result_layout.addWidget(vehicle_summary_frame, 1)
-
-        sim_control_row = QHBoxLayout()
-        sim_control_row.setSpacing(8)
-        vehicle_summary_layout.addLayout(sim_control_row)
-        self.lbl_sim_time = QLabel("仿真时间：0.0s / 0.0s")
-        sim_control_row.addWidget(self.lbl_sim_time)
-        sim_control_row.addSpacing(16)
-        self.lbl_sim_total_wait = QLabel("总等待：0s")
-        sim_control_row.addWidget(self.lbl_sim_total_wait)
-        sim_control_row.addSpacing(16)
-        self.sim_progress = QProgressBar(self.page_multi_result)
-        self.sim_progress.setRange(0, 1000)
-        self.sim_progress.setValue(0)
-        self.sim_progress.setTextVisible(True)
-        self.sim_progress.setFixedWidth(220)
-        self.sim_progress.setFormat("进度 %p%")
-        sim_control_row.addWidget(self.sim_progress)
-        sim_control_row.addStretch()
-        self.cmb_sim_speed = QComboBox()
-        self.cmb_sim_speed.addItems(["1x", "5x", "10x", "50x"])
-        self.cmb_sim_speed.setCurrentText("10x")
-        self.btn_sim_play = QPushButton("播放")
-        self.btn_sim_pause = QPushButton("暂停")
-        self.btn_sim_reset = QPushButton("重置")
-        sim_control_row.addWidget(QLabel("速度："))
-        sim_control_row.addWidget(self.cmb_sim_speed)
-        sim_control_row.addWidget(self.btn_sim_play)
-        sim_control_row.addWidget(self.btn_sim_pause)
-        sim_control_row.addWidget(self.btn_sim_reset)
+        result_layout.addWidget(vehicle_summary_frame, 3)
 
         self.sim_timer = QTimer(self)
         self.sim_timer.setInterval(100)
         self.sim_time = 0.0
+        self.current_defs = []
         self.last_schedule_rows = []
         self.last_analysis = None
         self.last_max_finish = 0.0
@@ -364,12 +338,13 @@ class ExportTicketWindow(QMainWindow):
         self.lbl_vehicle_summary.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.lbl_vehicle_summary.setWordWrap(True)
         self.lbl_vehicle_summary.setTextFormat(Qt.RichText)
-        self.lbl_vehicle_summary.setMaximumHeight(115)
+        self.lbl_vehicle_summary.setMinimumHeight(120)
+        self.lbl_vehicle_summary.setMaximumHeight(155)
         self.lbl_vehicle_summary.setStyleSheet(
             "background: #f7f9fc;"
             "border: 1px dashed #cbd5e1;"
             "border-radius: 8px;"
-            "padding: 16px;"
+            "padding: 10px;"
             "color: #334155;"
             "font-size: 13px;"
             "line-height: 1.5;"
@@ -377,29 +352,131 @@ class ExportTicketWindow(QMainWindow):
 
         vehicle_summary_layout.addWidget(self.lbl_vehicle_summary, 1)
 
-        self.sim_scene = QGraphicsScene(self)
-        self.sim_graphics_view = QGraphicsView(self.sim_scene, self.page_multi_result)
-        self.sim_graphics_view.setMinimumHeight(260)
-        self.sim_graphics_view.setStyleSheet(
-            "background: #f1f5f9;"
-            "border: 1px solid #cbd5e1;"
+        simulation_frame = QFrame(self.page_multi)
+        simulation_frame.setFrameShape(QFrame.StyledPanel)
+        simulation_frame.setObjectName("ticketBlock")
+        simulation_frame.setStyleSheet(
+            "QFrame#ticketBlock {"
+            "background: #ffffff;"
+            "border: 1px solid #d9dee7;"
             "border-radius: 10px;"
+            "}"
         )
-        vehicle_summary_layout.addWidget(self.sim_graphics_view, 2)
-        self.lbl_sim_view = QLabel("仿真画面：请先点击『分析当前排程』。")
+        simulation_layout = QVBoxLayout(simulation_frame)
+        simulation_layout.setContentsMargins(12, 12, 12, 10)
+        simulation_layout.setSpacing(6)
+        result_layout.addWidget(simulation_frame, 7)
+
+        sim_control_row = QHBoxLayout()
+        sim_control_row.setContentsMargins(0, 0, 0, 0)
+        sim_control_row.setSpacing(6)
+        sim_title = QLabel("仿真回放", simulation_frame)
+        sim_title.setStyleSheet("font-size: 14px; font-weight: 700; color: #223042;")
+        sim_control_row.addWidget(sim_title)
+        sim_control_row.addStretch(1)
+        self.lbl_sim_time = QLabel("仿真时间：0.0s / 0.0s")
+        sim_control_row.addWidget(self.lbl_sim_time)
+        sim_control_row.addSpacing(10)
+        self.lbl_sim_total_wait = QLabel("总等待：0s")
+        self.lbl_sim_total_wait.hide()
+        sim_control_row.addSpacing(10)
+        self.sim_progress = QProgressBar(self.page_multi_result)
+        self.sim_progress.setRange(0, 1000)
+        self.sim_progress.setValue(0)
+        self.sim_progress.setTextVisible(True)
+        self.sim_progress.setMinimumWidth(180)
+        self.sim_progress.setMaximumWidth(260)
+        self.sim_progress.setMaximumHeight(18)
+        self.sim_progress.setFormat("进度 %p%")
+        sim_control_row.addWidget(self.sim_progress)
+        self.cmb_sim_speed = QComboBox()
+        self.cmb_sim_speed.addItems(["1x", "5x", "10x", "50x"])
+        self.cmb_sim_speed.setCurrentText("10x")
+        self.btn_sim_play = QPushButton("播放")
+        self.btn_sim_pause = QPushButton("暂停")
+        self.btn_sim_reset = QPushButton("重置")
+        control_h = 26
+        self.cmb_sim_speed.setMinimumHeight(control_h)
+        self.cmb_sim_speed.setMaximumHeight(control_h)
+        self.btn_sim_play.setMinimumHeight(control_h)
+        self.btn_sim_play.setMaximumHeight(control_h)
+        self.btn_sim_pause.setMinimumHeight(control_h)
+        self.btn_sim_pause.setMaximumHeight(control_h)
+        self.btn_sim_reset.setMinimumHeight(control_h)
+        self.btn_sim_reset.setMaximumHeight(control_h)
+        self.btn_sim_play.setMinimumWidth(52)
+        self.btn_sim_pause.setMinimumWidth(52)
+        self.btn_sim_reset.setMinimumWidth(52)
+        sim_control_row.addWidget(QLabel("速度："))
+        sim_control_row.addWidget(self.cmb_sim_speed)
+        sim_control_row.addWidget(self.btn_sim_play)
+        sim_control_row.addWidget(self.btn_sim_pause)
+        sim_control_row.addWidget(self.btn_sim_reset)
+
+        self.sim_scene = QGraphicsScene(self)
+        self.sim_graphics_view = QGraphicsView(self.sim_scene, simulation_frame)
+        self.sim_graphics_view.setMinimumHeight(232)
+        self.sim_graphics_view.setMaximumHeight(252)
+        self.sim_graphics_view.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.sim_graphics_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.sim_graphics_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sim_graphics_view.setStyleSheet(
+            "background: #243244;"
+            "border: 1px solid #334155;"
+            "border-radius: 8px;"
+        )
+        simulation_layout.addLayout(sim_control_row, 0)
+        simulation_layout.addWidget(self.sim_graphics_view, 0)
+
+        sim_status_frame = QFrame(simulation_frame)
+        sim_status_frame.setObjectName("simStatusFrame")
+        sim_status_frame.setStyleSheet(
+            "QFrame#simStatusFrame {"
+            "background: #f8fafc;"
+            "border: 1px solid #cbd5e1;"
+            "border-radius: 6px;"
+            "}"
+        )
+        sim_status_layout = QVBoxLayout(sim_status_frame)
+        sim_status_layout.setContentsMargins(10, 6, 10, 5)
+        sim_status_layout.setSpacing(0)
+
+        self.lbl_sim_view = QLabel("仿真画面：请先点击『分析当前排程』。", sim_status_frame)
         self.lbl_sim_view.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.lbl_sim_view.setWordWrap(True)
-        self.lbl_sim_view.setMinimumHeight(90)
-        self.lbl_sim_view.setMaximumHeight(130)
+        self.lbl_sim_view.setTextFormat(Qt.RichText)
+        self.lbl_sim_view.setMinimumHeight(52)
+        self.lbl_sim_view.setMaximumHeight(58)
         self.lbl_sim_view.setStyleSheet(
-            "background: #ffffff;"
-            "border: 1px solid #e2e8f0;"
-            "border-radius: 8px;"
-            "padding: 12px;"
+            "background: transparent;"
+            "border: 0;"
+            "padding: 0;"
             "color: #334155;"
             "font-size: 12px;"
         )
-        vehicle_summary_layout.addWidget(self.lbl_sim_view, 1)
+        sim_status_layout.addWidget(self.lbl_sim_view)
+        sim_status_frame.setMinimumHeight(66)
+        sim_status_frame.setMaximumHeight(72)
+        simulation_layout.addStretch(1)
+        simulation_layout.addWidget(sim_status_frame, 0)
+
+        vehicle_log_entry = QFrame(self.page_multi_result)
+        vehicle_log_entry.setMaximumHeight(44)
+        vehicle_log_entry.setStyleSheet(
+            "background: #ffffff;"
+            "border: 1px solid #e2e8f0;"
+            "border-radius: 8px;"
+        )
+        vehicle_log_layout = QHBoxLayout(vehicle_log_entry)
+        vehicle_log_layout.setContentsMargins(12, 8, 12, 8)
+        vehicle_log_layout.setSpacing(8)
+        vehicle_log_title = QLabel("车辆明细 / 调试日志", vehicle_log_entry)
+        vehicle_log_title.setStyleSheet("font-size: 13px; font-weight: 700; color: #334155;")
+        vehicle_log_layout.addWidget(vehicle_log_title)
+        vehicle_log_layout.addStretch()
+        self.btn_vehicle_log = QPushButton("查看车辆日志", vehicle_log_entry)
+        vehicle_log_layout.addWidget(self.btn_vehicle_log)
+        result_layout.addWidget(vehicle_log_entry, 0)
 
         self.txt_schedule_debug = QPlainTextEdit(self.page_multi_result)
         self.txt_schedule_debug.setReadOnly(True)
@@ -415,7 +492,8 @@ class ExportTicketWindow(QMainWindow):
             "font-family: Menlo, Consolas, monospace;"
             "font-size: 11px;"
         )
-        vehicle_summary_layout.addWidget(self.txt_schedule_debug, 1)
+        self.txt_schedule_debug.hide()
+        result_layout.addWidget(self.txt_schedule_debug, 0)
 
         # ---------- Tab2：单工程组合票 ----------
         self.page_single = QWidget(self)
@@ -500,6 +578,7 @@ class ExportTicketWindow(QMainWindow):
         self.btn_sim_play.clicked.connect(self._start_simulation)
         self.btn_sim_pause.clicked.connect(self._pause_simulation)
         self.btn_sim_reset.clicked.connect(self._reset_simulation)
+        self.btn_vehicle_log.clicked.connect(self._show_vehicle_log_placeholder)
         self.sim_timer.timeout.connect(self._on_simulation_tick)
 
         # Tab 切换时，控制多工程页内步骤按钮是否可用
@@ -554,6 +633,7 @@ class ExportTicketWindow(QMainWindow):
             )
             analysis = tickets.analyze_schedule(rows, max_finish, target_takt)
             analysis = self._apply_time_window_analysis(analysis, rows, target_takt)
+            self.current_defs = list(defs or [])
             self.last_schedule_rows = rows
             self.last_analysis = analysis
             self.last_max_finish = float(max_finish or 0.0)
@@ -624,6 +704,148 @@ class ExportTicketWindow(QMainWindow):
         self._update_sim_view()
         self._draw_sim_scene()
 
+    def _fmt_vehicle_log_value(self, value):
+        if value is None:
+            return ""
+        try:
+            num = float(value)
+        except Exception:
+            return str(value)
+        if abs(num - round(num)) < 1e-9:
+            return str(int(round(num)))
+        return f"{num:.1f}"
+
+    def _build_vehicle_log_rows(self):
+        """按车辆维度整理当前 rows，仅用于只读日志弹窗。"""
+        rows = getattr(self, "last_schedule_rows", []) or []
+        if not rows:
+            return [], []
+
+        def _to_int(value, default=0):
+            try:
+                return int(float(value))
+            except Exception:
+                return default
+
+        def _row_station(row):
+            return str(row.get("step_display", row.get("station", row.get("group", ""))) or "")
+
+        columns = [
+            "车辆编号", "车型", "工序序号", "工序名称", "线别", "资源 key",
+            "start", "svc_finish", "depart", "end", "dur", "block_wait", "launch_wait",
+            "下一工序", "下一工序 start", "备注",
+        ]
+
+        output = []
+        car_rows = self._sim_car_rows()
+        sorted_car_items = sorted(
+            car_rows.items(),
+            key=lambda item: _to_int(item[0], 999999),
+        )
+        for car, segments in sorted_car_items:
+            sorted_segments = sorted(
+                list(segments or []),
+                key=lambda row: (
+                    self._sim_row_start(row),
+                    _to_int(row.get("step_seq", 0)),
+                ),
+            )
+            for idx, row in enumerate(sorted_segments):
+                next_row = sorted_segments[idx + 1] if idx + 1 < len(sorted_segments) else None
+                step_seq = _to_int(row.get("step_seq", ""), 0)
+                next_seq = _to_int(next_row.get("step_seq", ""), 0) if next_row else 0
+                note = ""
+                if next_row and step_seq > 0 and next_seq > step_seq + 1:
+                    skipped = ", ".join(str(seq) for seq in range(step_seq + 1, next_seq))
+                    note = f"跳过中间岗位：{skipped}"
+
+                output.append([
+                    str(car),
+                    str(row.get("car_type", row.get("duration_source", row.get("vehicle_type", ""))) or ""),
+                    str(row.get("step_seq", "")),
+                    _row_station(row),
+                    str(row.get("line_no", row.get("line", "")) or ""),
+                    str(row.get("resource_key", "") or ""),
+                    self._fmt_vehicle_log_value(row.get("start", row.get("start_time", ""))),
+                    self._fmt_vehicle_log_value(row.get("svc_finish", row.get("finish", ""))),
+                    self._fmt_vehicle_log_value(row.get("depart", row.get("end", ""))),
+                    self._fmt_vehicle_log_value(row.get("end", "")),
+                    self._fmt_vehicle_log_value(row.get("dur", row.get("duration", ""))),
+                    self._fmt_vehicle_log_value(row.get("block_wait", 0.0)),
+                    self._fmt_vehicle_log_value(row.get("launch_wait", 0.0)),
+                    _row_station(next_row) if next_row else "无",
+                    self._fmt_vehicle_log_value(next_row.get("start", next_row.get("start_time", ""))) if next_row else "",
+                    note,
+                ])
+
+        return columns, output
+
+    def _copy_vehicle_log_to_clipboard(self, columns, rows):
+        lines = ["\t".join(columns)]
+        lines.extend("\t".join(str(value) for value in row) for row in rows)
+        QApplication.clipboard().setText("\n".join(lines))
+        self.status.showMessage("车辆日志已复制到剪贴板", 3000)
+
+    def _show_vehicle_log_placeholder(self):
+        rows = getattr(self, "last_schedule_rows", []) or []
+        if not rows:
+            QMessageBox.information(self, "车辆明细 / 调试日志", "请先点击“分析当前排程”生成车辆日志。")
+            return
+
+        columns, log_rows = self._build_vehicle_log_rows()
+        vehicle_count = len(self._sim_car_rows())
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("车辆明细 / 调试日志")
+        dialog.resize(1000, 650)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        info = QLabel(
+            f"只读排程明细：rows 共 {len(rows)} 条，车辆 {vehicle_count} 台。"
+            "下一工序基于同一车辆 rows 顺序计算；用于排查 depart / block_wait / 跳过岗位。"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#475569;font-size:12px;")
+        layout.addWidget(info)
+
+        table = QTableWidget(len(log_rows), len(columns), dialog)
+        table.setHorizontalHeaderLabels(columns)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+
+        for r, row_values in enumerate(log_rows):
+            for c, value in enumerate(row_values):
+                item = QTableWidgetItem(str(value))
+                if c in (0, 2, 6, 7, 8, 9, 10, 11, 12, 14):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                table.setItem(r, c, item)
+
+        table.horizontalHeader().setStretchLastSection(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        table.resizeColumnsToContents()
+        table.setSortingEnabled(True)
+        layout.addWidget(table, 1)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        btn_copy = QPushButton("复制全部日志", dialog)
+        btn_close = QPushButton("关闭", dialog)
+        button_row.addWidget(btn_copy)
+        button_row.addWidget(btn_close)
+        layout.addLayout(button_row)
+
+        btn_copy.clicked.connect(lambda: self._copy_vehicle_log_to_clipboard(columns, log_rows))
+        btn_close.clicked.connect(dialog.accept)
+
+        dialog.exec()
+
     def _on_simulation_tick(self):
         """仿真计时推进。后续车辆绘制会基于 sim_time 刷新画面。"""
         total = float(getattr(self, "last_max_finish", 0.0) or 0.0)
@@ -666,6 +888,57 @@ class ExportTicketWindow(QMainWindow):
         except Exception:
             return start
 
+    def _sim_row_service_finish(self, row: dict) -> float:
+        """读取当前工程加工完成时间，优先使用 svc_finish。"""
+        value = self._sim_row_value(
+            row,
+            "svc_finish",
+            "finish",
+            "finish_time",
+            "end",
+            default=None,
+        )
+        if value is not None:
+            try:
+                return float(value or 0.0)
+            except Exception:
+                pass
+        return self._sim_row_end(row)
+
+    def _sim_row_depart(self, row: dict) -> float:
+        """读取车辆可离开当前工程的时间，优先使用 depart。"""
+        value = self._sim_row_value(
+            row,
+            "depart",
+            "end",
+            "out",
+            "out_time",
+            "svc_finish",
+            "finish",
+            default=None,
+        )
+        if value is not None:
+            try:
+                return float(value or 0.0)
+            except Exception:
+                pass
+        return max(self._sim_row_service_finish(row), self._sim_row_end(row))
+
+    def _sim_row_wait_end(self, row: dict, next_row: dict | None = None) -> float:
+        """
+        等待阶段的显示终点。
+
+        规则：
+        - 优先停留在当前工程所在位置；
+        - depart/end 只作为“仍停留在当前工程”的参考；
+        - 如果下一工程尚未开始，current < next_start 时不允许提前跳到 next_row。
+        """
+        wait_start = self._sim_row_service_finish(row)
+        wait_end = max(wait_start, self._sim_row_depart(row))
+        if next_row is not None:
+            wait_end = max(wait_end, self._sim_row_start(next_row))
+        return wait_end
+
     def _sim_row_station(self, row: dict) -> str:
         return str(self._sim_row_value(row, "step_display", "station", "display", "name", "group", default="岗位") or "岗位")
 
@@ -683,6 +956,37 @@ class ExportTicketWindow(QMainWindow):
     def _sim_row_line_no(self, row: dict) -> str:
         """兼容读取排程行线别，用于 v2-4 线别验证。"""
         return str(self._sim_row_value(row, "line_no", "line", "line_scope", default="") or "")
+
+    def _sim_row_resource_key(self, row: dict) -> str:
+        """兼容读取排程行资源 key。"""
+        return str(self._sim_row_value(row, "resource_key", default="") or "")
+
+    def _sim_row_block_wait(self, row: dict) -> float:
+        """读取当前工程后方阻塞等待时间，仅用于 UI 保守显示。"""
+        value = self._sim_row_value(row, "block_wait", default=0.0)
+        try:
+            return float(value or 0.0)
+        except Exception:
+            return 0.0
+
+    def _sim_wait_is_blocking(self, row: dict, next_row: dict | None, occupied_resources: set[str]) -> bool:
+        """
+        UI 安全模式下，默认不把等待解释为“阻塞”。
+
+        说明：
+        - 当前项目的稳定诉求是保留新画布结构，但收缩显示层解释；
+        - finish -> next_start 之间的时间差，不应由 UI 轻易推断成“被谁阻塞”；
+        - process_over_takt_root_text 属于模型结果说明，也不用于实时阻塞判定。
+
+        因此这里保守返回 False，等待文案统一走“等待Xs”。
+        未来如果 rows 中新增了明确、可靠的实时阻塞字段，再单独恢复更细判断。
+        """
+        return False
+
+    def _sim_wait_label(self, row: dict, next_row: dict | None, current: float, wait_end: float, occupied_resources: set[str]) -> str:
+        """统一生成等待文案；安全模式下默认只显示等待时长。"""
+        wait_remain = max(0.0, wait_end - current)
+        return f"等待{wait_remain:.1f}s"
 
     def _build_schedule_debug_log(self, rows, limit: int = 200) -> str:
         """临时排程运行日志，用于 v2 排程模型验证；后续稳定后可隐藏或删除。"""
@@ -751,7 +1055,27 @@ class ExportTicketWindow(QMainWindow):
         return grouped
 
     def _sim_station_names(self):
-        """按排程行出现顺序提取岗位名。"""
+        """优先按岗位矩阵 seq 顺序提取岗位名。"""
+        defs = getattr(self, "current_defs", None) or []
+        if defs:
+            ordered = []
+            seen = set()
+            sortable_defs = []
+            for idx, item in enumerate(defs):
+                try:
+                    seq_value = int(item.get("seq", idx + 1) or (idx + 1))
+                except Exception:
+                    seq_value = idx + 1
+                name = str(item.get("display") or item.get("group") or "岗位").strip() or "岗位"
+                sortable_defs.append((seq_value, idx, name))
+            sortable_defs.sort(key=lambda x: (x[0], x[1]))
+            for _, _, name in sortable_defs:
+                if name not in seen:
+                    ordered.append(name)
+                    seen.add(name)
+            if ordered:
+                return ordered
+
         names = []
         seen = set()
         for row in getattr(self, "last_schedule_rows", []) or []:
@@ -761,8 +1085,39 @@ class ExportTicketWindow(QMainWindow):
                 seen.add(name)
         return names
 
+    def _sim_station_defs(self):
+        """返回动画展示使用的岗位顺序与标签，优先使用 current_defs 的 seq。"""
+        defs = getattr(self, "current_defs", None) or []
+        if defs:
+            ordered = []
+            seen = set()
+            sortable_defs = []
+            for idx, item in enumerate(defs):
+                try:
+                    seq_value = int(item.get("seq", idx + 1) or (idx + 1))
+                except Exception:
+                    seq_value = idx + 1
+                name = str(item.get("display") or item.get("group") or "岗位").strip() or "岗位"
+                sortable_defs.append((seq_value, idx, name, item))
+            sortable_defs.sort(key=lambda x: (x[0], x[1]))
+            for seq_value, _, name, source in sortable_defs:
+                if name not in seen:
+                    ordered.append({
+                        "seq": seq_value,
+                        "name": name,
+                        "device_count": source.get("device_count"),
+                        "line_scope": source.get("line_scope"),
+                        "run_mode": source.get("run_mode"),
+                    })
+                    seen.add(name)
+            if ordered:
+                return ordered
+
+        names = self._sim_station_names()
+        return [{"seq": idx + 1, "name": name} for idx, name in enumerate(names)]
+
     def _update_sim_view(self):
-        """刷新简易仿真画面。当前阶段用文字展示岗位轨道与加工中的车辆。"""
+        """刷新简易仿真画面。当前阶段只展示当前加工中的车辆摘要。"""
         if not hasattr(self, "lbl_sim_view"):
             return
 
@@ -772,58 +1127,141 @@ class ExportTicketWindow(QMainWindow):
             return
 
         current = float(getattr(self, "sim_time", 0.0) or 0.0)
-        station_names = self._sim_station_names()
-        station_line = " → ".join([f"ST-{i + 1} {name}" for i, name in enumerate(station_names)])
 
         active_rows = []
-        next_rows = []
         for row in rows:
             start = self._sim_row_start(row)
-            end = self._sim_row_end(row)
-            if start <= current < end:
-                active_rows.append((start, end, row))
-            elif start > current:
-                next_rows.append((start, end, row))
+            svc_finish = self._sim_row_service_finish(row)
+            if start <= current < svc_finish:
+                active_rows.append((start, svc_finish, row))
 
         active_rows.sort(key=lambda x: (self._sim_row_station(x[2]), x[0]))
-        next_rows.sort(key=lambda x: x[0])
+        waiting_rows = []
+        car_rows = self._sim_car_rows()
+        for _, car_segments in car_rows.items():
+            if not car_segments:
+                continue
+            for idx, seg in enumerate(car_segments):
+                next_seg = car_segments[idx + 1] if idx + 1 < len(car_segments) else None
+                wait_start = self._sim_row_service_finish(seg)
+                wait_end = self._sim_row_wait_end(seg, next_seg)
+                if wait_start <= current < wait_end:
+                    waiting_rows.append((wait_start, wait_end, seg, next_seg))
+                    break
 
-        lines = [
-            f"当前时间：{current:.1f}s",
-            f"岗位轨道：{station_line or '—'}",
-            "",
-            "加工中车辆：",
-        ]
+        waiting_rows.sort(key=lambda x: (self._sim_row_station(x[2]), x[0]))
 
+        def _escape_lines(lines):
+            return [escape(str(line)) for line in lines if str(line).strip()]
+
+        def _compress_lines(lines, max_lines):
+            cleaned = [str(line).strip() for line in lines if str(line).strip()]
+            if not cleaned:
+                return ["无"]
+            if len(cleaned) <= max_lines:
+                return cleaned
+            kept = cleaned[:max_lines]
+            overflow = len(cleaned) - max_lines
+            kept[-1] = f"{kept[-1]} / ……还有 {overflow} 台"
+            return kept
+
+        def _slot_html(lines):
+            escaped_lines = _escape_lines(lines)
+            while len(escaped_lines) < 2:
+                escaped_lines.append("&#12288;")
+            return "".join(
+                f"<div style='margin:0;padding:0;line-height:1.28;'>{line}</div>"
+                for line in escaped_lines[:2]
+            )
+
+        active_lines = []
         if active_rows:
-            for start, end, row in active_rows[:8]:
+            max_active_rows = 3
+            for start, end, row in active_rows[:max_active_rows]:
                 car_label = self._sim_row_car_label(row)
                 station = self._sim_row_station(row)
-                dur = max(0.0, end - start)
                 remain = max(0.0, end - current)
                 line_no = self._sim_row_line_no(row)
-                line_suffix = f" ｜ 线别 {line_no}" if line_no else ""
-                run_mode = self._sim_row_run_mode(row)
-                mode_suffix = f" ｜ {run_mode}" if run_mode else ""
-                lines.append(f"- PROC {car_label} @ {station}{line_suffix}{mode_suffix} ｜ 开始 {start:.1f}s ｜ 加工 {dur:.1f}s ｜ 剩余 {remain:.1f}s")
-            if len(active_rows) > 8:
-                lines.append(f"- ……还有 {len(active_rows) - 8} 台/段正在加工")
+                detail_parts = [f"{car_label} @ {station}"]
+                if line_no:
+                    detail_parts.append(str(line_no))
+                if remain > 0:
+                    detail_parts.append(f"剩余{remain:.1f}s")
+                active_lines.append("｜".join(detail_parts))
+            if len(active_rows) > max_active_rows:
+                active_lines.append(f"……还有 {len(active_rows) - max_active_rows} 台")
         else:
-            lines.append("- 当前无车辆处于加工中")
+            active_lines.append("无")
+        active_lines = _compress_lines(active_lines, 2)
 
-        lines.append("")
-        lines.append("下一段即将开始：")
-        if next_rows:
-            for start, end, row in next_rows[:3]:
+        waiting_lines = []
+        if waiting_rows:
+            max_wait_rows = 2
+            for wait_start, wait_end, row, next_row in waiting_rows[:max_wait_rows]:
                 car_label = self._sim_row_car_label(row)
                 station = self._sim_row_station(row)
                 line_no = self._sim_row_line_no(row)
-                line_suffix = f" ｜ 线别 {line_no}" if line_no else ""
-                lines.append(f"- {car_label} @ {station}{line_suffix} ｜ {start:.1f}s 开始")
+                detail_parts = [f"{car_label} @ {station}"]
+                if line_no:
+                    detail_parts.append(str(line_no))
+                wait_text = self._sim_wait_label(row, next_row, current, wait_end, set())
+                if wait_text:
+                    detail_parts.append(wait_text)
+                waiting_lines.append("｜".join(detail_parts))
+            if len(waiting_rows) > max_wait_rows:
+                waiting_lines.append(f"……还有 {len(waiting_rows) - max_wait_rows} 台")
         else:
-            lines.append("- 已无后续加工段")
+            waiting_lines.append("无")
+        waiting_lines = _compress_lines(waiting_lines, 2)
 
-        self.lbl_sim_view.setText("\n".join(lines))
+        analysis = getattr(self, "last_analysis", None)
+        summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
+        model_hint_text = str(
+            summary.get("process_over_takt_root_text")
+            or summary.get("process_root_text")
+            or "无"
+        ).strip() or "无"
+        if model_hint_text != "无":
+            normalized_blocking = (
+                model_hint_text.replace("、", "，")
+                .replace(",", "，")
+                .replace("；", "，")
+                .replace(";", "，")
+            )
+            blocking_parts = [
+                part.strip() for part in normalized_blocking.split("，") if part.strip()
+            ]
+            if len(blocking_parts) > 2:
+                model_hint_text = f"超节拍工程：{'，'.join(blocking_parts[:2])} 等"
+            elif blocking_parts:
+                model_hint_text = f"超节拍工程：{'，'.join(blocking_parts)}"
+        else:
+            model_hint_text = "详见模型结果"
+        blocking_lines = _compress_lines(model_hint_text.splitlines() or [model_hint_text], 2)
+
+        active_html = _slot_html(active_lines)
+        waiting_html = _slot_html(waiting_lines)
+        blocking_html = _slot_html(blocking_lines)
+
+        html = (
+            "<table width='100%' cellspacing='0' cellpadding='0'>"
+            "<tr>"
+            "<td width='33%' style='width:33%;vertical-align:top;padding-right:8px;'>"
+            "<div style='font-size:12px;font-weight:700;color:#334155;margin-bottom:2px;'>加工中车辆</div>"
+            f"<div style='font-size:12px;line-height:1.24;color:#334155;'>{active_html}</div>"
+            "</td>"
+            "<td width='34%' style='width:34%;vertical-align:top;padding:0 8px;border-left:1px solid #e2e8f0;'>"
+            "<div style='font-size:12px;font-weight:700;color:#334155;margin-bottom:2px;'>等待中</div>"
+            f"<div style='font-size:12px;line-height:1.24;color:#334155;'>{waiting_html}</div>"
+            "</td>"
+            "<td width='33%' style='width:33%;vertical-align:top;padding-left:8px;border-left:1px solid #e2e8f0;'>"
+            "<div style='font-size:12px;font-weight:700;color:#334155;margin-bottom:2px;'>模型提示</div>"
+            f"<div style='font-size:12px;line-height:1.24;color:#334155;'>{blocking_html}</div>"
+            "</td>"
+            "</tr>"
+            "</table>"
+        )
+        self.lbl_sim_view.setText(html)
 
     # ------------- 多车组合票：动作 ------------- #
     def add_row(self):
@@ -1783,6 +2221,7 @@ class ExportTicketWindow(QMainWindow):
         planned_n_finish_time = _fmt_optional_seconds(summary.get("planned_n_finish_time"))
         actual_n_finish_time = _fmt_optional_seconds(summary.get("actual_n_finish_time"))
         finish_delta_raw = summary.get("finish_delta")
+        finish_delta_num = None
         if finish_delta_raw is None:
             finish_delta = "—"
         else:
@@ -1793,42 +2232,106 @@ class ExportTicketWindow(QMainWindow):
                 finish_delta = str(finish_delta_raw)
         actual_line_takt_in_window = _fmt_optional_seconds(summary.get("actual_line_takt_in_window"))
 
+        def _metric_card(title, value, value_color="#0f172a"):
+            return (
+                "<td width='20%' style='"
+                "width:20%;"
+                "border:1px solid #dbe3ef;"
+                "background:#ffffff;"
+                "padding:8px 9px;"
+                "vertical-align:top;"
+                "'>"
+                f"<div style='font-size:10px;color:#64748b;'>{title}</div>"
+                f"<div style='font-size:14px;font-weight:700;color:{value_color};margin-top:3px;'>{value}</div>"
+                "</td>"
+            )
+
         is_ratio = hasattr(self, "cmb_launch_mode") and self.cmb_launch_mode.currentIndex() == 1
         if is_ratio:
             ratio_a = int(self.spn_a_cars.value()) if hasattr(self, "spn_a_cars") else 0
             ratio_b = int(self.spn_b_cars.value()) if hasattr(self, "spn_b_cars") else 0
             ratio_c = int(self.spn_c_cars.value()) if hasattr(self, "spn_c_cars") else 0
             analysis_minutes = int(self.spn_total_cars.value()) if hasattr(self, "spn_total_cars") else 0
-            mode_line = (
-                f"投车模式：按比例投车，A:B:C = {ratio_a}:{ratio_b}:{ratio_c}，"
-                f"分析时间 {analysis_minutes} 分钟。"
-            )
+            summary_lines = [
+                (
+                    ("模式", "按比例投车"),
+                    ("比例", f"{ratio_a}:{ratio_b}:{ratio_c}"),
+                ),
+                (
+                    ("时间", f"{analysis_minutes}分钟"),
+                    ("目标节拍", f"{target_takt_display}s"),
+                ),
+                (
+                    ("投车台数", f"{total_cars}台"),
+                ),
+            ]
         else:
             seq_text = self.cmb_seq.currentText() if hasattr(self, "cmb_seq") else "—"
-            mode_line = f"投车模式：按数量投车，排列方式：{seq_text}。"
+            summary_lines = [
+                (
+                    ("模式", "按数量投车"),
+                    ("A/B/C", f"A{type_counts['A']}/B{type_counts['B']}/C{type_counts['C']}"),
+                ),
+                (
+                    ("排列", seq_text),
+                    ("目标节拍", f"{target_takt_display}s"),
+                ),
+                (
+                    ("投车台数", f"{total_cars}台"),
+                ),
+            ]
 
-        if is_ratio:
-            left_html = (
-                "<b>基础排程</b><br>"
-                "计时参考：首车进入首岗位时刻为 0s<br>"
-                f"{mode_line}<br>"
-                f"车型生成：A{type_counts['A']}台 / B{type_counts['B']}台 / C{type_counts['C']}台（共{total_cars}台）"
+        def _summary_line(items):
+            return "｜".join(
+                f"<span style='color:#64748b;'>{label}：</span><b style='color:#0f172a;'>{value}</b>"
+                for label, value in items
             )
-        else:
-            left_html = (
-                "<b>基础排程</b><br>"
-                "计时参考：首车进入首岗位时刻为 0s<br>"
-                f"{mode_line}<br>"
-                f"实际生成：A {type_counts['A']} 台 / B {type_counts['B']} 台 / C {type_counts['C']} 台（共 {total_cars} 台）"
-            )
+
+        left_html = (
+            "<div style='font-weight:700;color:#334155;margin-bottom:6px;'>基础排程摘要</div>"
+            "<div style='font-size:13px;color:#1e293b;line-height:1.75;'>"
+            + "<br>".join(_summary_line(line) for line in summary_lines)
+            + "</div>"
+        )
         if is_ratio and time_window_result:
+            if str(final_result).upper() == "OK":
+                final_color = "#16a34a"
+            elif str(final_result).upper() == "NG":
+                final_color = "#dc2626"
+            else:
+                final_color = "#0f172a"
+
+            if finish_delta_num is None:
+                finish_delta_color = "#0f172a"
+                remark_delta = "差异—"
+            elif finish_delta_num > 0:
+                finish_delta_color = "#dc2626"
+                remark_delta = f"超时{self._fmt_analysis_num(abs(finish_delta_num))}s"
+            elif finish_delta_num < 0:
+                finish_delta_color = "#16a34a"
+                remark_delta = f"富余{self._fmt_analysis_num(abs(finish_delta_num))}s"
+            else:
+                finish_delta_color = "#0f172a"
+                remark_delta = "准时0s"
+
+            remark_color = finish_delta_color
+            model_cards = [
+                _metric_card("最终判定", final_result, final_color),
+                _metric_card("下线台数", f"{display_actual_output_count}/{planned_output_count}"),
+                _metric_card("达成率", f"{achievement_rate:.1f}%"),
+                _metric_card("实际节拍", f"{actual_line_takt_in_window}/{target_takt_display}"),
+                _metric_card("累计阻塞", f"{blocking_time}s"),
+            ]
             right_html = (
-                "<b>模型判定</b><br>"
-                f"最终判定：{final_result}<br>"
-                f"下线达成：计划{planned_output_count}台｜实际{display_actual_output_count}台｜达成率{achievement_rate:.1f}%<br>"
-                f"计划完成：计划{planned_n_finish_time}s｜实际{actual_n_finish_time}s｜差异{finish_delta}s<br>"
-                f"实际下线节拍：{actual_line_takt_in_window}s/台｜目标{target_takt_display}s/台<br>"
-                f"阻塞分析：累计阻塞{blocking_time}s｜超节拍工程：{process_root_text}"
+                "<div style='font-size:13px;font-weight:700;color:#334155;margin-bottom:4px;'>模型结果</div>"
+                "<div style='margin-bottom:2px;'>"
+                "<table width='100%' cellspacing='2' cellpadding='0' style='width:100%;'>"
+                "<tr>"
+                + "".join(model_cards)
+                + "</tr></table>"
+                "</div>"
+                f"<div style='font-size:11px;color:#334155;line-height:1.3;margin-top:2px;margin-bottom:0;'>超节拍工程：{process_root_text}｜备注：计划{planned_n_finish_time}s完成｜实际{actual_n_finish_time}s完成｜"
+                f"<span style='color:{remark_color};font-weight:700;'>{remark_delta}</span></div>"
             )
         else:
             try:
@@ -1873,19 +2376,31 @@ class ExportTicketWindow(QMainWindow):
             has_blocking = total_wait_raw > 0
 
             quantity_final_result = "NG" if (has_finish_gap or has_blocking or has_over_takt_root) else "OK"
+            quantity_final_color = "#dc2626" if quantity_final_result == "NG" else "#16a34a"
 
+            model_cards = [
+                _metric_card("最终判定", quantity_final_result, quantity_final_color),
+                _metric_card("生成台数", f"{total_cars}台"),
+                _metric_card("完成时间", f"{max_finish}s"),
+                _metric_card("计划时间", f"{planned_finish}s"),
+                _metric_card("累计阻塞", f"{blocking_time}s"),
+            ]
             right_html = (
-                "<b>模型判定</b><br>"
-                f"最终判定：{quantity_final_result}<br>"
-                f"计划完成时间：{planned_finish}s｜总完成时间：{max_finish}s<br>"
-                f"累计阻塞：{blocking_time}s｜超节拍工程：{process_root_text}"
+                "<div style='font-size:13px;font-weight:700;color:#334155;margin-bottom:4px;'>模型结果</div>"
+                "<div style='margin-bottom:2px;'>"
+                "<table width='100%' cellspacing='2' cellpadding='0' style='width:100%;'>"
+                "<tr>"
+                + "".join(model_cards)
+                + "</tr></table>"
+                "</div>"
+                f"<div style='font-size:11px;color:#334155;line-height:1.3;margin-top:2px;margin-bottom:0;'>超节拍工程：{process_root_text}</div>"
             )
         
         html = (
             "<table width='100%' cellspacing='0' cellpadding='0'>"
             "<tr>"
-            f"<td width='50%' valign='top' style='padding-right:12px;'>{left_html}</td>"
-            f"<td width='50%' valign='top' style='padding-left:12px; border-left:1px solid #cbd5e1;'>{right_html}</td>"
+            f"<td width='30%' valign='top' style='width:30%;padding-right:12px;border-right:1px solid #dbe3ef;'>{left_html}</td>"
+            f"<td width='70%' valign='top' style='width:70%;padding-left:12px;'>{right_html}</td>"
             "</tr>"
             "</table>"
         )
@@ -1904,7 +2419,7 @@ class ExportTicketWindow(QMainWindow):
         return active
 
     def _draw_sim_scene(self):
-        """绘制生产线轨道沙盘风仿真：固定岗位卡片 + 轨道线 + PROC/WAIT 车辆。"""
+        """绘制横向双轨坐标系的生产线仿真底图。"""
         if not hasattr(self, "sim_scene"):
             return
 
@@ -1914,360 +2429,473 @@ class ExportTicketWindow(QMainWindow):
             self.sim_scene.addText("请先点击『分析当前排程』生成仿真数据。")
             return
 
-        station_names = self._sim_station_names()
+        station_defs = self._sim_station_defs()
+        station_names = [item["name"] for item in station_defs]
         if not station_names:
             self.sim_scene.addText("暂无岗位数据。")
             return
 
-        current = float(getattr(self, "sim_time", 0.0) or 0.0)
-        total = float(getattr(self, "last_max_finish", 0.0) or 0.0)
+        station_count = len(station_names)
+        view_w = 0
+        if hasattr(self, "sim_graphics_view") and self.sim_graphics_view is not None:
+            try:
+                view_w = int(self.sim_graphics_view.viewport().width() or 0)
+            except Exception:
+                view_w = 0
+        view_w = max(920, view_w or 0)
 
-        compact_mode = len(station_names) > 6
-        margin_x = 20 if compact_mode else 24
-        station_w = 96 if compact_mode else 132
-        station_h = 54 if compact_mode else 60
-        gap = 12 if compact_mode else 24
-        y_station = 34
-        y_track = y_station + station_h + 34
-        y_car_base = y_track + 16
-        car_w = 54 if compact_mode else 72
-        car_h = 28 if compact_mode else 34
+        margin_x = 20
+        line_label_w = 64
+        track_lead_w = 14
+        zone_top = 24
+        line1_y = 88
+        line2_y = 148
+        lane_gap = line2_y - line1_y
+        title_band_h = 34
 
-        scene_w = (
-            margin_x * 2
-            + len(station_names) * station_w
-            + max(0, len(station_names) - 1) * gap
-            + 120
-        )
-        scene_h = y_car_base + 4 * (car_h + 10) + 36
-        scene_w = max(scene_w, 760)
-        scene_h = max(scene_h, 270 if compact_mode else 250)
+        def _get_station_metrics(count, available_width):
+            if count <= 4:
+                pref_station_w, pref_gap = 208, 24
+            elif count == 5:
+                pref_station_w, pref_gap = 176, 14
+            elif count == 6:
+                pref_station_w, pref_gap = 154, 12
+            elif count == 7:
+                pref_station_w, pref_gap = 134, 10
+            else:
+                pref_station_w, pref_gap = 118, 8
 
-        # 浅色工业沙盘背景
+            if count <= 1:
+                return pref_station_w, pref_gap
+
+            pref_total = count * pref_station_w + (count - 1) * pref_gap
+            if pref_total <= available_width:
+                return pref_station_w, pref_gap
+
+            min_gap = 6
+            min_station_w = 96 if count >= 8 else 108
+            fit_station_w = int((available_width - (count - 1) * min_gap) / max(1, count))
+            fit_station_w = max(min_station_w, fit_station_w)
+            return fit_station_w, min_gap
+
+        usable_track_w = max(620, view_w - margin_x * 2 - line_label_w - track_lead_w - 28)
+        station_w, station_gap = _get_station_metrics(station_count, usable_track_w)
+        compact_mode = station_w <= 134
+        slot_h = 38 if compact_mode else 40
+        slot_w = max(82, station_w - 24)
+        zone_h = int((line2_y + slot_h / 2 + 18) - zone_top)
+        track_start_x = margin_x + line_label_w
+        first_station_x = track_start_x + track_lead_w
+        last_station_x = first_station_x + (station_count - 1) * (station_w + station_gap)
+        track_end_x = last_station_x + station_w + 18
+        scene_w = max(view_w - 6, track_end_x + margin_x)
+        scene_h = zone_top + zone_h + 14
+
         self.sim_scene.addRect(
             0,
             0,
             scene_w,
             scene_h,
-            QPen(QColor("#f1f5f9")),
-            QBrush(QColor("#f1f5f9")),
+            QPen(QColor("#243244")),
+            QBrush(QColor("#243244")),
         )
 
-        title = self.sim_scene.addText(f"SIM TIME：{current:.1f}s / {total:.1f}s")
-        title.setDefaultTextColor(QColor("#334155"))
-        title.setPos(margin_x, 6)
+        def _station_device_mode(station_info):
+            scope = str(station_info.get("line_scope") or "").strip()
+            try:
+                device_count = int(float(station_info.get("device_count") or 0))
+            except Exception:
+                device_count = 0
 
-        # 极简图例
-        legend = self.sim_scene.addText("A 蓝｜B 橙｜C 绿｜PROC 加工｜WAIT 等待｜IDLE 空闲")
-        legend.setDefaultTextColor(QColor("#64748b"))
-        legend.setPos(margin_x + 220, 6)
+            if scope in ("1号线", "2号线"):
+                return "single"
+            if scope == "双线共用":
+                return "shared"
+            if scope == "双线" and device_count == 1:
+                return "shared"
+            return "parallel"
 
-        station_x = {}
-        station_centers = []
-        for idx, name in enumerate(station_names):
-            x = margin_x + idx * (station_w + gap)
-            station_x[name] = x
-            station_centers.append(x + station_w / 2)
+        def _line_slots(line_scope):
+            scope = str(line_scope or "").strip()
+            if scope == "1号线":
+                return [("1号线", True), ("2号线", False)]
+            if scope == "2号线":
+                return [("1号线", False), ("2号线", True)]
+            return [("1号线", True), ("2号线", True)]
+
+        def _line_key(line_no):
+            text = str(line_no or "").strip()
+            if "2" in text:
+                return "2号线"
+            return "1号线"
+
+        def _build_sim_track_layout():
+            layout = {}
+            for idx, station_info in enumerate(station_defs):
+                x = first_station_x + idx * (station_w + station_gap)
+                slot_x = x + max(0, (station_w - slot_w) / 2)
+                layout[station_info["name"]] = {
+                    "x": x,
+                    "title_x": x + 12,
+                    "slot_x": slot_x,
+                    "1号线": {
+                        "x": slot_x,
+                        "y": line1_y - slot_h / 2,
+                        "w": slot_w,
+                        "h": slot_h,
+                    },
+                    "2号线": {
+                        "x": slot_x,
+                        "y": line2_y - slot_h / 2,
+                        "w": slot_w,
+                        "h": slot_h,
+                    },
+                }
+            return layout
+
+        def _draw_track_headers():
+            for label, y in (("1号线", line1_y), ("2号线", line2_y)):
+                head_item = self.sim_scene.addText(label)
+                head_item.setDefaultTextColor(QColor("#cbd5e1"))
+                font = QFont()
+                font.setPointSize(11)
+                font.setBold(True)
+                head_item.setFont(font)
+                head_item.setPos(margin_x, y - 15)
+                self.sim_scene.addLine(
+                    track_start_x - 12,
+                    y,
+                    track_start_x - 1,
+                    y,
+                    QPen(QColor("#64748b"), 1),
+                )
+
+        def _draw_lane_lines():
+            channel_h = 22
+            channel_fill = QBrush(QColor("#334155"))
+            channel_border = QPen(QColor(100, 116, 139, 150), 1)
+            texture_pen = QPen(QColor(71, 85, 105, 115), 1)
+            for idx in range(station_count - 1):
+                left_x = first_station_x + idx * (station_w + station_gap) + station_w - 1
+                right_x = first_station_x + (idx + 1) * (station_w + station_gap) + 1
+                if right_x <= left_x:
+                    continue
+                for y in (line1_y, line2_y):
+                    self.sim_scene.addRect(
+                        left_x,
+                        y - channel_h / 2,
+                        right_x - left_x,
+                        channel_h,
+                        QPen(Qt.NoPen),
+                        channel_fill,
+                    )
+                    self.sim_scene.addLine(
+                        left_x,
+                        y - channel_h / 2,
+                        right_x,
+                        y - channel_h / 2,
+                        channel_border,
+                    )
+                    self.sim_scene.addLine(
+                        left_x,
+                        y + channel_h / 2,
+                        right_x,
+                        y + channel_h / 2,
+                        channel_border,
+                    )
+                    texture_x = left_x + 8
+                    while texture_x < right_x - 4:
+                        self.sim_scene.addLine(
+                            texture_x,
+                            y - channel_h / 2 + 3,
+                            texture_x,
+                            y + channel_h / 2 - 3,
+                            texture_pen,
+                        )
+                        texture_x += 10
+
+        def _draw_station_zone(station_info, layout_info):
+            x = layout_info["x"]
+            self.sim_scene.addRect(
+                x,
+                zone_top,
+                station_w,
+                zone_h,
+                QPen(QColor(148, 163, 184, 105), 1),
+                QBrush(QColor(203, 213, 225, 90)),
+            )
+
+            title_item = self.sim_scene.addText(f"ST-{station_info['seq']} {station_info['name']}")
+            title_item.setDefaultTextColor(QColor("#e5e7eb"))
+            title_font = QFont()
+            title_font.setPointSize(9 if station_count >= 8 else (10 if compact_mode else 11))
+            title_font.setBold(True)
+            title_item.setFont(title_font)
+            title_item.document().setDocumentMargin(0)
+            title_item.setTextWidth(max(74, station_w - 20))
+            title_item.setPos(layout_info["title_x"] - 2, zone_top + 11)
+
+            if _station_device_mode(station_info) == "shared":
+                badge_w = 56
+                badge_h = 18
+                badge_x = x + station_w - badge_w - 12
+                badge_y = zone_top + 12
+                self.sim_scene.addRect(
+                    badge_x,
+                    badge_y,
+                    badge_w,
+                    badge_h,
+                    QPen(QColor("#f59e0b"), 1),
+                    QBrush(QColor("#fffbeb")),
+                )
+                badge_item = self.sim_scene.addText("共用设备")
+                badge_item.setDefaultTextColor(QColor("#b45309"))
+                badge_item.setPos(badge_x + 6, badge_y + 1)
+
+        def _draw_station_track_slot(slot, enabled):
+            if enabled:
+                pen = QPen(QColor(148, 163, 184, 95), 1)
+                brush = QBrush(QColor(248, 250, 252, 175))
+            else:
+                pen = QPen(QColor(156, 163, 175, 75), 1, Qt.DashLine)
+                brush = QBrush(QColor(203, 213, 225, 70))
+            self.sim_scene.addRect(
+                slot["x"],
+                slot["y"],
+                slot["w"],
+                slot["h"],
+                pen,
+                brush,
+            )
+            status_text = "空闲" if enabled else "不适用"
+            status_item = self.sim_scene.addText(status_text)
+            slot_font = QFont()
+            slot_font.setPointSize(9 if compact_mode else 10)
+            status_item.setFont(slot_font)
+            status_item.setDefaultTextColor(QColor("#94a3b8" if enabled else "#9ca3af"))
+            status_item.setPos(slot["x"] + 10, slot["y"] + max(8, (slot["h"] - 18) / 2))
+
+        def _draw_slot_waiting_outline(slot):
+            self.sim_scene.addRect(
+                slot["x"],
+                slot["y"],
+                slot["w"],
+                slot["h"],
+                QPen(QColor("#f97316"), 2),
+            )
+
+        def _draw_overflow_badge(x, y, count):
+            badge_w = 52
+            badge_h = 18
+            self.sim_scene.addRect(
+                x,
+                y,
+                badge_w,
+                badge_h,
+                QPen(QColor("#64748b"), 1),
+                QBrush(QColor("#f8fafc")),
+            )
+            badge_item = self.sim_scene.addText(f"还有{count}台")
+            badge_item.setDefaultTextColor(QColor("#334155"))
+            badge_item.setPos(x + 4, y + 1)
+
+        def _vehicle_block_label(row):
+            car_type = str(
+                self._sim_row_value(row, "car_type", "type", "vehicle_type", default="")
+                or ""
+            ).upper()
+            car_no = str(self._sim_row_value(row, "car", "car_no", "car_id", default="") or "")
+            return f"{car_type or '车'}-{car_no or '?'}"
+
+        def _draw_vehicle_capsule(x, y, w, h, row, status, seconds_text, over_takt=False):
+            car_type = str(
+                self._sim_row_value(row, "car_type", "type", "vehicle_type", default="")
+                or ""
+            ).upper()
+            if over_takt:
+                border = QColor("#dc2626")
+                fill = QColor("#fee2e2")
+                status_color = QColor("#dc2626")
+            elif status == "等待":
+                border = QColor("#f97316")
+                fill = QColor("#ffedd5")
+                status_color = QColor("#c2410c")
+            else:
+                border = QColor("#16a34a")
+                fill = QColor("#dcfce7")
+                status_color = QColor("#15803d")
+
+            if car_type == "A":
+                type_bar = QColor("#2563eb")
+            elif car_type == "B":
+                type_bar = QColor("#ea580c")
+            elif car_type == "C":
+                type_bar = QColor("#16a34a")
+            else:
+                type_bar = QColor("#64748b")
 
             self.sim_scene.addRect(
                 x,
-                y_station,
-                station_w,
-                station_h,
-                QPen(QColor("#cbd5e1"), 1),
-                QBrush(QColor("#ffffff")),
+                y,
+                w,
+                h,
+                QPen(border, 2),
+                QBrush(fill),
             )
-
-            station_label = f"ST-{idx + 1}\n{name}"
-            text = self.sim_scene.addText(station_label)
-            text.setDefaultTextColor(QColor("#1e293b"))
-            text.setPos(x + 7, y_station + 5)
-
-        # 主轨道线：岗位固定，车辆在轨道层活动
-        if station_centers:
-            track_start = station_centers[0]
-            track_end = station_centers[-1]
-            self.sim_scene.addLine(
-                track_start,
-                y_track,
-                track_end,
-                y_track,
-                QPen(QColor("#94a3b8"), 3),
+            self.sim_scene.addRect(
+                x,
+                y,
+                5,
+                h,
+                QPen(type_bar, 1),
+                QBrush(type_bar),
             )
-            for center in station_centers:
-                self.sim_scene.addEllipse(
-                    center - 4,
-                    y_track - 4,
-                    8,
-                    8,
-                    QPen(QColor("#64748b")),
-                    QBrush(QColor("#ffffff")),
-                )
+            label_item = self.sim_scene.addText(f"{_vehicle_block_label(row)} {status}")
+            label_font = QFont()
+            label_font.setPointSize(9 if compact_mode else 10)
+            label_font.setBold(True)
+            label_item.setFont(label_font)
+            label_item.setDefaultTextColor(status_color)
+            label_item.document().setDocumentMargin(0)
+            label_item.setTextWidth(max(58, w - 16))
+            label_item.setPos(x + 10, y + 4)
+            detail_item = self.sim_scene.addText(seconds_text)
+            detail_font = QFont()
+            detail_font.setPointSize(8 if compact_mode else 9)
+            detail_item.setFont(detail_font)
+            detail_item.setDefaultTextColor(QColor("#334155"))
+            detail_item.document().setDocumentMargin(0)
+            detail_item.setTextWidth(max(58, w - 16))
+            detail_item.setPos(x + 10, y + (20 if compact_mode else 21))
 
-        car_draw_items = []
+        station_layout = _build_sim_track_layout()
+        _draw_track_headers()
+        _draw_lane_lines()
+
+        slot_rects = {}
+        station_modes = {}
+        for station_info in station_defs:
+            name = station_info["name"]
+            line_scope = station_info.get("line_scope")
+            station_modes[name] = _station_device_mode(station_info)
+            layout_info = station_layout[name]
+            _draw_station_zone(station_info, layout_info)
+            slots = _line_slots(line_scope)
+            slot_rects[name] = {}
+            for line_label, enabled in slots:
+                slot = dict(layout_info[line_label])
+                slot["enabled"] = enabled
+                _draw_station_track_slot(slot, enabled)
+                slot_rects[name][line_label] = slot
+
+        current = float(getattr(self, "sim_time", 0.0) or 0.0)
         target_takt = float(self.spn_target_takt.value()) if hasattr(self, "spn_target_takt") else 0.0
-        station_proc_counts = {name: 0 for name in station_names}
-        station_wait_counts = {name: 0 for name in station_names}
-        station_over_counts = {name: 0 for name in station_names}
+        vehicle_blocks = []
+
+        for row in rows:
+            start = self._sim_row_start(row)
+            svc_finish = self._sim_row_service_finish(row)
+            if start <= current < svc_finish:
+                elapsed = max(0.0, current - start)
+                remain = max(0.0, svc_finish - current)
+                vehicle_blocks.append({
+                    "station": self._sim_row_station(row),
+                    "line": _line_key(self._sim_row_line_no(row)),
+                    "row": row,
+                    "status": "超时" if target_takt > 0 and elapsed > target_takt else "加工",
+                    "seconds": f"超时{elapsed - target_takt:.1f}s" if target_takt > 0 and elapsed > target_takt else f"剩余{remain:.1f}s",
+                    "over_takt": target_takt > 0 and elapsed > target_takt,
+                    "order_time": start,
+                })
 
         car_rows = self._sim_car_rows()
         for _, car_segments in car_rows.items():
             if not car_segments:
                 continue
-
-            first_start = self._sim_row_start(car_segments[0])
-            last_end = self._sim_row_end(car_segments[-1])
-
-            # 未进入排程、已完成车辆都不显示，保持画面聚焦当前状态
-            if current < first_start or current >= last_end:
-                continue
-
-            label = self._sim_row_car_label(car_segments[0])
-            car_type = str(
-                self._sim_row_value(
-                    car_segments[0],
-                    "car_type",
-                    "type",
-                    "vehicle_type",
-                    default=""
-                ) or ""
-            ).upper()
-
-            for i, seg in enumerate(car_segments):
-                start = self._sim_row_start(seg)
-                end = self._sim_row_end(seg)
-                station = self._sim_row_station(seg)
-                station_base_x = station_x.get(station, margin_x)
-                next_seg = car_segments[i + 1] if i + 1 < len(car_segments) else None
-
-                # PROC：显示在当前岗位下方，只在岗位范围内轻微移动，不提前跨到下一岗位
-                if start <= current < end:
-                    station_proc_counts[station] = station_proc_counts.get(station, 0) + 1
-                    elapsed_in_segment = max(0.0, current - start)
-                    is_over_takt = target_takt > 0 and elapsed_in_segment > target_takt
-                    if is_over_takt:
-                        station_over_counts[station] = station_over_counts.get(station, 0) + 1
-                    progress = 0.0
-                    if end > start:
-                        progress = max(0.0, min(1.0, (current - start) / (end - start)))
-                    inner_move = max(0, station_w - car_w - 4)
-                    x_pos = station_base_x + 2 + progress * inner_move
-                    car_draw_items.append({
-                        "label": label,
-                        "car_type": car_type,
-                        "status": "PROC",
-                        "station": station,
-                        "x": x_pos,
-                        "order_time": start,
-                        "over_takt": is_over_takt,
+            for idx, seg in enumerate(car_segments):
+                next_seg = car_segments[idx + 1] if idx + 1 < len(car_segments) else None
+                wait_start = self._sim_row_service_finish(seg)
+                wait_end = self._sim_row_wait_end(seg, next_seg)
+                if wait_start <= current < wait_end:
+                    vehicle_blocks.append({
+                        "station": self._sim_row_station(seg),
+                        "line": _line_key(self._sim_row_line_no(seg)),
+                        "row": seg,
+                        "status": "等待",
+                        "seconds": self._sim_wait_label(seg, next_seg, current, wait_end, set()),
+                        "over_takt": False,
+                        "order_time": wait_start,
                     })
                     break
 
-                # WAIT：停在原岗位出口附近，表示等待进入下一岗位
-                if next_seg is not None:
-                    next_start = self._sim_row_start(next_seg)
-                    if end <= current < next_start:
-                        station_wait_counts[station] = station_wait_counts.get(station, 0) + 1
-                        x_pos = station_base_x + station_w - car_w - 6
-                        car_draw_items.append({
-                            "label": label,
-                            "car_type": car_type,
-                            "status": "WAIT",
-                            "station": station,
-                            "x": x_pos,
-                            "order_time": end,
-                        })
-                        break
+        shared_processing = {}
+        for item in sorted(vehicle_blocks, key=lambda value: value["order_time"]):
+            if station_modes.get(item["station"]) != "shared":
+                continue
+            if item["status"] == "等待":
+                continue
+            station_name = item["station"]
+            if station_name not in shared_processing:
+                shared_processing[station_name] = item
+                continue
+            item["status"] = "等待"
+            item["seconds"] = "等待"
+            item["over_takt"] = False
 
-        # Andon 状态提示：固定在岗位卡片底部，岗位与车辆分离但关系清晰
-        for station in station_names:
-            x = station_x.get(station, margin_x)
-            proc_count = station_proc_counts.get(station, 0)
-            wait_count = station_wait_counts.get(station, 0)
-            over_count = station_over_counts.get(station, 0)
-            # 岗位状态只用颜色提示：红=超节拍，橙=等待，绿=加工，灰=空闲
-            status_text = "●"
-            if over_count > 0:
-                status_color = QColor("#dc2626")
-                card_border = QColor("#dc2626")
-            elif wait_count > 0:
-                status_color = QColor("#f97316")
-                card_border = QColor("#f97316")
-            elif proc_count > 0:
-                status_color = QColor("#16a34a")
-                card_border = QColor("#16a34a")
-            else:
-                status_color = QColor("#94a3b8")
-                card_border = QColor("#cbd5e1")
+        def _vehicle_sort_key(item):
+            station_index = station_names.index(item["station"]) if item["station"] in station_names else 999
+            status_rank = 1 if item["status"] == "等待" else 0
+            return station_index, item["line"], status_rank, item["order_time"]
 
-            # 状态色边条，强化工位当前状态
-            self.sim_scene.addRect(
-                x,
-                y_station,
-                4,
-                station_h,
-                QPen(card_border),
-                QBrush(card_border),
+        vehicle_blocks.sort(key=_vehicle_sort_key)
+        slot_groups = {}
+        for item in vehicle_blocks:
+            station_slots = slot_rects.get(item["station"])
+            if not station_slots:
+                continue
+            slot_line = item["line"]
+            slot = station_slots.get(item["line"])
+            if not slot or not slot.get("enabled"):
+                fallback = next(
+                    (
+                        (line_label, candidate)
+                        for line_label, candidate in station_slots.items()
+                        if candidate.get("enabled")
+                    ),
+                    None,
+                )
+                if fallback:
+                    slot_line, slot = fallback
+            if not slot:
+                continue
+            slot_key = (item["station"], slot_line)
+            slot_groups.setdefault(slot_key, {"slot": slot, "items": []})["items"].append(item)
+
+        for slot_group in slot_groups.values():
+            slot = slot_group["slot"]
+            items = slot_group["items"]
+            if not items:
+                continue
+            main_item = items[0]
+            overflow_count = max(0, len(items) - 1)
+            block_w = slot["w"] - 8
+            if overflow_count:
+                block_w = max(82, block_w - 58)
+            _draw_vehicle_capsule(
+                slot["x"] + 4,
+                slot["y"] + 3,
+                block_w,
+                slot["h"] - 6,
+                main_item["row"],
+                main_item["status"],
+                main_item["seconds"],
+                main_item.get("over_takt", False),
             )
-
-            status_item = self.sim_scene.addText(status_text)
-            status_item.setDefaultTextColor(status_color)
-            status_item.setPos(x + 7, y_station + station_h - 19)
-
-        # 车辆块：只显示 PROC / WAIT，不显示 DONE
-        status_order = {"PROC": 0, "WAIT": 1}
-        car_draw_items.sort(
-            key=lambda item: (
-                station_names.index(item["station"]) if item["station"] in station_names else 999,
-                status_order.get(item["status"], 9),
-                item["order_time"],
-            )
-        )
-
-        lane_counts = {}
-        max_lane = 0
-        for item in car_draw_items[:24]:
-            station = item["station"]
-            lane = lane_counts.get(station, 0)
-            lane_counts[station] = lane + 1
-            max_lane = max(max_lane, lane + 1)
-
-            x = float(item["x"])
-            y = y_car_base + lane * (car_h + 10)
-            status = item["status"]
-            car_type = item["car_type"]
-
-            if item.get("over_takt"):
-                border = QColor("#dc2626")
-            elif status == "PROC":
-                border = QColor("#16a34a")
-            elif status == "WAIT":
-                border = QColor("#f97316")
-            else:
-                border = QColor("#94a3b8")
-
-            if car_type == "A":
-                fill = QColor("#dbeafe")
-                type_bar = QColor("#2563eb")
-            elif car_type == "B":
-                fill = QColor("#ffedd5")
-                type_bar = QColor("#ea580c")
-            elif car_type == "C":
-                fill = QColor("#dcfce7")
-                type_bar = QColor("#16a34a")
-            else:
-                fill = QColor("#f1f5f9")
-                type_bar = QColor("#64748b")
-
-            # 工业仿真小车块：阴影 + 彩色车身 + 大编号 + 双轮，适合小尺寸动画快速识别
-            body_h = car_h * 0.66
-            body_y = y + car_h * 0.14
-            shadow_offset = 3
-
-            self.sim_scene.addRect(
-                x + shadow_offset,
-                body_y + shadow_offset,
-                car_w,
-                body_h,
-                QPen(QColor("#cbd5e1"), 1),
-                QBrush(QColor("#cbd5e1")),
-            )
-            self.sim_scene.addRect(
-                x,
-                body_y,
-                car_w,
-                body_h,
-                QPen(border, 2),
-                QBrush(fill),
-            )
-
-            # 车型色条：左侧小色块，A/B/C 一眼区分
-            self.sim_scene.addRect(
-                x,
-                body_y,
-                5,
-                body_h,
-                QPen(type_bar),
-                QBrush(type_bar),
-            )
-
-            # 前窗/车头提示：右侧浅色窗块，让方块仍有车辆方向感
-            nose_w = 8 if compact_mode else 10
-            self.sim_scene.addRect(
-                x + car_w - nose_w - 3,
-                body_y + 4,
-                nose_w,
-                max(8, body_h - 8),
-                QPen(border, 1),
-                QBrush(QColor("#f8fafc")),
-            )
-
-            # 顶部高光，增加一点立体感
-            self.sim_scene.addLine(
-                x + 8,
-                body_y + 4,
-                x + car_w - nose_w - 8,
-                body_y + 4,
-                QPen(QColor("#ffffff"), 1),
-            )
-            
-            # 双轮：简化黑色轮胎
-            wheel_r = 4 if compact_mode else 5
-            wheel_y = body_y + body_h - 1
-            front_wheel_x = x + car_w * 0.24
-            rear_wheel_x = x + car_w * 0.76
-            for wx in (front_wheel_x, rear_wheel_x):
-                self.sim_scene.addEllipse(
-                    wx - wheel_r,
-                    wheel_y - wheel_r,
-                    wheel_r * 2,
-                    wheel_r * 2,
-                    QPen(QColor("#1e293b"), 1),
-                    QBrush(QColor("#1e293b")),
+            if overflow_count:
+                _draw_overflow_badge(
+                    slot["x"] + slot["w"] - 56,
+                    slot["y"] + max(4, (slot["h"] - 18) / 2),
+                    overflow_count,
                 )
 
-            # 状态标签：超节拍/等待/加工时显示在车辆上方，车身内只放编号
-            if item.get("over_takt"):
-                tag_text = "超节拍"
-                tag_color = QColor("#dc2626")
-            elif status == "WAIT":
-                tag_text = "WAIT"
-                tag_color = QColor("#f97316")
-            else:
-                tag_text = "PROC"
-                tag_color = QColor("#16a34a")
-
-            tag_x = x
-            tag_y = max(y - 2, body_y - 19)
-            tag_bg_w = 44 if compact_mode else 52
-            tag_bg_h = 16
-
-            self.sim_scene.addRect(
-                tag_x,
-                tag_y,
-                tag_bg_w,
-                tag_bg_h,
-                QPen(tag_color),
-                QBrush(tag_color),
-            )
-            
-            tag_item = self.sim_scene.addText(tag_text)
-            tag_item.setDefaultTextColor(QColor("#ffffff"))
-            tag_item.setPos(tag_x + 3, tag_y - 1)
-            tag_item.setZValue(2)
-
-            short_label = str(item["label"]).replace("Car#", "#").replace("(", "").replace(")", "")
-            car_no = "".join(ch for ch in short_label if ch.isdigit()) or short_label
-
-            car_text = self.sim_scene.addText(car_no)
-            car_text.setDefaultTextColor(QColor("#0f172a"))
-            car_text.setPos(x + car_w * 0.42, body_y + body_h * 0.23)
-            car_text.setZValue(3)
-
-        if not car_draw_items:
-            empty = self.sim_scene.addText("当前时间无车辆处于加工或等待状态")
-            empty.setDefaultTextColor(QColor("#64748b"))
-            empty.setPos(margin_x, y_car_base)
-
-        scene_h = y_car_base + max(1, max_lane) * (car_h + 10) + 42
-        self.sim_scene.setSceneRect(0, 0, scene_w, max(scene_h, 270 if compact_mode else 250))
+        self.sim_scene.setSceneRect(0, 0, scene_w, scene_h)
