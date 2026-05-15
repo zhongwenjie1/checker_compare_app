@@ -792,9 +792,6 @@ class ExportTicketWindow(QMainWindow):
             QMessageBox.information(self, "车辆明细 / 调试日志", "请先点击“分析当前排程”生成车辆日志。")
             return
 
-        columns, log_rows = self._build_vehicle_log_rows()
-        vehicle_count = len(self._sim_car_rows())
-
         dialog = QDialog(self)
         dialog.setWindowTitle("车辆明细 / 调试日志")
         dialog.resize(1000, 650)
@@ -804,34 +801,26 @@ class ExportTicketWindow(QMainWindow):
         layout.setSpacing(10)
 
         info = QLabel(
-            f"只读排程明细：rows 共 {len(rows)} 条，车辆 {vehicle_count} 台。"
-            "下一工序基于同一车辆 rows 顺序计算；用于排查 depart / block_wait / 跳过岗位。"
+            "车辆明细 / 调试日志：按车辆维度一车一行显示；"
+            "用于查看每台车的完整工序流转、等待与跳过岗位。"
         )
         info.setWordWrap(True)
         info.setStyleSheet("color:#475569;font-size:12px;")
         layout.addWidget(info)
 
-        table = QTableWidget(len(log_rows), len(columns), dialog)
-        table.setHorizontalHeaderLabels(columns)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setAlternatingRowColors(True)
-        table.verticalHeader().setVisible(False)
-
-        for r, row_values in enumerate(log_rows):
-            for c, value in enumerate(row_values):
-                item = QTableWidgetItem(str(value))
-                if c in (0, 2, 6, 7, 8, 9, 10, 11, 12, 14):
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                else:
-                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                table.setItem(r, c, item)
-
-        table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        table.resizeColumnsToContents()
-        table.setSortingEnabled(True)
-        layout.addWidget(table, 1)
+        text_edit = QPlainTextEdit(dialog)
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(self._build_schedule_debug_log(rows, limit=9999))
+        text_edit.setStyleSheet(
+            "QPlainTextEdit{"
+            "font-family: Menlo, Monaco, Consolas, monospace;"
+            "font-size: 12px;"
+            "color: #0f172a;"
+            "background: #f8fafc;"
+            "border: 1px solid #cbd5e1;"
+            "}"
+        )
+        layout.addWidget(text_edit, 1)
 
         button_row = QHBoxLayout()
         button_row.addStretch()
@@ -841,7 +830,7 @@ class ExportTicketWindow(QMainWindow):
         button_row.addWidget(btn_close)
         layout.addLayout(button_row)
 
-        btn_copy.clicked.connect(lambda: self._copy_vehicle_log_to_clipboard(columns, log_rows))
+        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(text_edit.toPlainText()))
         btn_close.clicked.connect(dialog.accept)
 
         dialog.exec()
@@ -989,54 +978,141 @@ class ExportTicketWindow(QMainWindow):
         return f"等待{wait_remain:.1f}s"
 
     def _build_schedule_debug_log(self, rows, limit: int = 200) -> str:
-        """临时排程运行日志，用于 v2 排程模型验证；后续稳定后可隐藏或删除。"""
+        """按车辆维度输出一车一行的排程流转日志。"""
         if not rows:
             return "暂无排程 rows。"
 
-        lines = [
-            "排程运行日志（临时验证用）",
-            "字段：Car | 岗位 | 线别 | 资源 | 理论投车 | 开始 | 完成 | 离开 | 工时 | 等待",
-            "-" * 120,
-        ]
-
-        def _fmt(value):
+        def _fmt_sec(value):
             try:
                 return f"{float(value or 0.0):.1f}"
             except Exception:
-                return str(value)
+                return "0.0"
 
-        sorted_rows = sorted(
-            list(rows or []),
-            key=lambda r: (
-                int(r.get("car", r.get("car_no", r.get("car_index", 0))) or 0),
-                float(r.get("start", r.get("start_time", 0.0)) or 0.0),
-                int(r.get("step_seq", 0) or 0),
-            ),
-        )
+        def _float_value(row, *keys, default=0.0):
+            for key in keys:
+                if key in row and row.get(key) not in (None, ""):
+                    try:
+                        return float(row.get(key) or 0.0)
+                    except Exception:
+                        return default
+            return default
 
-        for idx, row in enumerate(sorted_rows[:limit], start=1):
-            car = row.get("car", row.get("car_no", row.get("car_index", "?")))
-            car_type = str(row.get("car_type", row.get("duration_source", row.get("vehicle_type", ""))) or "")
-            station = str(row.get("step_display", row.get("station", row.get("group", "岗位"))) or "岗位")
-            line_no = str(row.get("line_no", row.get("line", "")) or "")
-            resource_key = str(row.get("resource_key", "") or "")
-            theory_launch = row.get("theory_launch_time", "")
-            start = row.get("start", row.get("start_time", 0.0))
-            svc_finish = row.get("svc_finish", row.get("finish", row.get("end", 0.0)))
-            depart = row.get("depart", row.get("end", row.get("svc_finish", 0.0)))
-            dur = row.get("dur", row.get("duration", 0.0))
-            wait = float(row.get("block_wait", 0.0) or 0.0) + float(row.get("launch_wait", 0.0) or 0.0)
+        def _int_sort_value(value):
+            try:
+                return 0, int(value)
+            except Exception:
+                return 1, str(value)
+
+        def _row_car(row):
+            return row.get("car", row.get("car_no", row.get("car_index", "?")))
+
+        def _row_car_type(row):
+            return str(row.get("car_type", row.get("duration_source", row.get("vehicle_type", ""))) or "")
+
+        def _row_step_seq(row):
+            return row.get("step_seq", row.get("seq", ""))
+
+        def _row_station(row):
+            return str(row.get("step_display", row.get("station", row.get("group", "岗位"))) or "岗位")
+
+        def _row_start(row):
+            return _float_value(row, "start", "start_time")
+
+        def _row_depart(row):
+            return _float_value(row, "depart", "end", "svc_finish", "finish")
+
+        def _row_dur(row):
+            return _float_value(row, "dur", "duration")
+
+        def _row_launch_wait(row):
+            return _float_value(row, "launch_wait")
+
+        def _row_block_wait(row):
+            return _float_value(row, "block_wait")
+
+        grouped = {}
+        for row in rows or []:
+            grouped.setdefault(_row_car(row), []).append(row)
+
+        for car_rows in grouped.values():
+            car_rows.sort(key=lambda r: (_row_start(r), _int_sort_value(_row_step_seq(r))))
+
+        try:
+            target_takt = float(self.spn_target_takt.value()) if hasattr(self, "spn_target_takt") else 0.0
+        except Exception:
+            target_takt = 0.0
+
+        lines = [
+            "车辆明细 / 调试日志（按车辆维度）",
+            "说明：FLOW(s)=OUT-IN，RESULT=单车工序节拍观察结果，不代表模型最终判定。",
+            "-" * 120,
+            f"{'CAR':<8}{'TYPE':<6}{'IN(s)':>10}{'OUT(s)':>10}{'WAIT(s)':>10}{'FLOW(s)':>10}  {'RESULT':<8}  SEGMENTS",
+            "-" * 120,
+        ]
+
+        sorted_car_items = sorted(grouped.items(), key=lambda item: _int_sort_value(item[0]))
+        for car, car_rows in sorted_car_items[:limit]:
+            if not car_rows:
+                continue
+
+            car_type = _row_car_type(car_rows[0])
+            first_start = _row_start(car_rows[0])
+            final_finish = _row_depart(car_rows[-1])
+            total_wait = sum(_row_launch_wait(row) + _row_block_wait(row) for row in car_rows)
+            flow_time = max(0.0, final_finish - first_start)
+            car_result = "工序NG" if target_takt > 0 and any(_row_dur(row) > target_takt for row in car_rows) else "工序OK"
+
+            step_parts = []
+            remarks = []
+            previous_seq = None
+            for row in car_rows:
+                step_seq = _row_step_seq(row)
+                station = _row_station(row)
+                start = _row_start(row)
+                dur = _row_dur(row)
+                launch_wait = _row_launch_wait(row)
+                block_wait = _row_block_wait(row)
+                step_label = f"ST{step_seq}" if step_seq not in (None, "") else "ST?"
+                step_parts.append(
+                    f"{step_label} {station}(开:{_fmt_sec(start)}s 加:{_fmt_sec(dur)}s "
+                    f"等前:{_fmt_sec(launch_wait)}s 等后:{_fmt_sec(block_wait)}s)"
+                )
+
+                try:
+                    current_seq = int(step_seq)
+                except Exception:
+                    current_seq = None
+                if previous_seq is not None and current_seq is not None and current_seq - previous_seq > 1:
+                    skipped = ",".join(str(seq) for seq in range(previous_seq + 1, current_seq))
+                    remarks.append(f"跳过中间岗位：{skipped}")
+                if current_seq is not None:
+                    previous_seq = current_seq
+
+                for key in ("remark", "remarks", "note", "备注"):
+                    value = str(row.get(key, "") or "").strip()
+                    if value:
+                        remarks.append(value)
+
+            unique_remarks = []
+            for remark in remarks:
+                if remark not in unique_remarks:
+                    unique_remarks.append(remark)
+            remark_text = f" 备注：{'；'.join(unique_remarks)}" if unique_remarks else ""
 
             lines.append(
-                f"{idx:03d}. Car#{car}({car_type}) | {station} | "
-                f"线别 {line_no or '—'} | 资源 {resource_key or '—'} | "
-                f"理论投车 {_fmt(theory_launch)}s | 开始 {_fmt(start)}s | "
-                f"完成 {_fmt(svc_finish)}s | 离开 {_fmt(depart)}s | "
-                f"工时 {_fmt(dur)}s | 等待 {_fmt(wait)}s"
+                f"{'Car#' + str(car):<8}"
+                f"{(car_type or '—'):<6}"
+                f"{_fmt_sec(first_start):>10}"
+                f"{_fmt_sec(final_finish):>10}"
+                f"{_fmt_sec(total_wait):>10}"
+                f"{_fmt_sec(flow_time):>10}"
+                f"  {car_result:<8}  "
+                + " | ".join(step_parts)
+                + remark_text
             )
 
-        if len(sorted_rows) > limit:
-            lines.append(f"……仅显示前 {limit} 条，共 {len(sorted_rows)} 条。")
+        if len(sorted_car_items) > limit:
+            lines.append(f"……仅显示前 {limit} 台车，共 {len(sorted_car_items)} 台。")
 
         return "\n".join(lines)
     
@@ -2707,6 +2783,36 @@ class ExportTicketWindow(QMainWindow):
             car_no = str(self._sim_row_value(row, "car", "car_no", "car_id", default="") or "")
             return f"{car_type or '车'}-{car_no or '?'}"
 
+        def _slot_status_text(status, seconds_text):
+            if status == "移动":
+                return ""
+            if status == "超时":
+                return seconds_text if str(seconds_text).startswith("超时") else f"超时 {seconds_text}"
+            if status == "等待":
+                return seconds_text if str(seconds_text).startswith("等待") else f"等待 {seconds_text}"
+            return f"{status} {seconds_text}".strip()
+
+        def _draw_slot_status_label(slot, status, seconds_text):
+            label_text = _slot_status_text(status, seconds_text)
+            if not label_text:
+                return
+            if status == "超时":
+                color = QColor("#ef4444")
+            elif status == "等待":
+                color = QColor("#fb923c")
+            else:
+                color = QColor("#22c55e")
+            label_item = self.sim_scene.addText(label_text)
+            label_font = QFont()
+            label_font.setPointSize(8 if compact_mode else 9)
+            label_font.setBold(True)
+            label_item.setFont(label_font)
+            label_item.setDefaultTextColor(color)
+            label_item.document().setDocumentMargin(0)
+            label_item.setTextWidth(slot["w"])
+            label_item.setPos(slot["x"] + 2, max(zone_top + title_band_h - 2, slot["y"] - 15))
+            label_item.setZValue(4)
+
         def _draw_vehicle_capsule(x, y, w, h, row, status, seconds_text, over_takt=False):
             car_type = str(
                 self._sim_row_value(row, "car_type", "type", "vehicle_type", default="")
@@ -2715,15 +2821,15 @@ class ExportTicketWindow(QMainWindow):
             if over_takt:
                 border = QColor("#dc2626")
                 fill = QColor("#fee2e2")
-                status_color = QColor("#dc2626")
             elif status == "等待":
                 border = QColor("#f97316")
                 fill = QColor("#ffedd5")
-                status_color = QColor("#c2410c")
+            elif status == "移动":
+                border = QColor("#38bdf8")
+                fill = QColor("#e0f2fe")
             else:
                 border = QColor("#16a34a")
                 fill = QColor("#dcfce7")
-                status_color = QColor("#15803d")
 
             if car_type == "A":
                 type_bar = QColor("#2563eb")
@@ -2734,6 +2840,15 @@ class ExportTicketWindow(QMainWindow):
             else:
                 type_bar = QColor("#64748b")
 
+            shadow_offset = 2
+            self.sim_scene.addRect(
+                x + shadow_offset,
+                y + shadow_offset,
+                w,
+                h,
+                QPen(QColor(15, 23, 42, 80), 1),
+                QBrush(QColor(15, 23, 42, 60)),
+            )
             self.sim_scene.addRect(
                 x,
                 y,
@@ -2750,23 +2865,46 @@ class ExportTicketWindow(QMainWindow):
                 QPen(type_bar, 1),
                 QBrush(type_bar),
             )
-            label_item = self.sim_scene.addText(f"{_vehicle_block_label(row)} {status}")
+
+            nose_w = 8 if compact_mode else 10
+            self.sim_scene.addRect(
+                x + w - nose_w - 3,
+                y + 4,
+                nose_w,
+                max(8, h - 8),
+                QPen(border, 1),
+                QBrush(QColor("#f8fafc")),
+            )
+            self.sim_scene.addLine(
+                x + 9,
+                y + 4,
+                x + w - nose_w - 8,
+                y + 4,
+                QPen(QColor("#ffffff"), 1),
+            )
+
+            wheel_r = 4 if compact_mode else 5
+            wheel_y = y + h - 1
+            for wheel_x in (x + w * 0.25, x + w * 0.76):
+                self.sim_scene.addEllipse(
+                    wheel_x - wheel_r,
+                    wheel_y - wheel_r,
+                    wheel_r * 2,
+                    wheel_r * 2,
+                    QPen(QColor("#0f172a"), 1),
+                    QBrush(QColor("#0f172a")),
+                )
+
+            label_item = self.sim_scene.addText(_vehicle_block_label(row))
             label_font = QFont()
-            label_font.setPointSize(9 if compact_mode else 10)
+            label_font.setPointSize(10 if compact_mode else 11)
             label_font.setBold(True)
             label_item.setFont(label_font)
-            label_item.setDefaultTextColor(status_color)
+            label_item.setDefaultTextColor(QColor("#0f172a"))
             label_item.document().setDocumentMargin(0)
-            label_item.setTextWidth(max(58, w - 16))
-            label_item.setPos(x + 10, y + 4)
-            detail_item = self.sim_scene.addText(seconds_text)
-            detail_font = QFont()
-            detail_font.setPointSize(8 if compact_mode else 9)
-            detail_item.setFont(detail_font)
-            detail_item.setDefaultTextColor(QColor("#334155"))
-            detail_item.document().setDocumentMargin(0)
-            detail_item.setTextWidth(max(58, w - 16))
-            detail_item.setPos(x + 10, y + (20 if compact_mode else 21))
+            label_item.setTextWidth(max(40, w - 18))
+            label_item.setPos(x + 12, y + max(3, (h - 17) / 2))
+            label_item.setZValue(5)
 
         station_layout = _build_sim_track_layout()
         _draw_track_headers()
@@ -2788,11 +2926,139 @@ class ExportTicketWindow(QMainWindow):
                 _draw_station_track_slot(slot, enabled)
                 slot_rects[name][line_label] = slot
 
+        def _slot_for_row(row):
+            station_slots = slot_rects.get(self._sim_row_station(row))
+            if not station_slots:
+                return None, ""
+            slot_line = _line_key(self._sim_row_line_no(row))
+            slot = station_slots.get(slot_line)
+            if not slot or not slot.get("enabled"):
+                fallback = next(
+                    (
+                        (line_label, candidate)
+                        for line_label, candidate in station_slots.items()
+                        if candidate.get("enabled")
+                    ),
+                    None,
+                )
+                if fallback:
+                    slot_line, slot = fallback
+            return slot, slot_line
+
+        def _vehicle_rect_from_slot(slot, block_w=None):
+            default_w = min(slot["w"] - 22, 78 if compact_mode else 88)
+            w = block_w if block_w is not None else default_w
+            w = max(54, min(w, slot["w"] - 12))
+            h = min(slot["h"] - 12, 24 if compact_mode else 26)
+            return {
+                "x": slot["x"] + (slot["w"] - w) / 2,
+                "y": slot["y"] + (slot["h"] - h) / 2,
+                "w": w,
+                "h": h,
+            }
+
+        def _smoothstep(value):
+            value = max(0.0, min(1.0, value))
+            return value * value * (3 - 2 * value)
+
+        def _lerp_point(start_point, end_point, ratio):
+            eased = _smoothstep(ratio)
+            return (
+                start_point[0] + (end_point[0] - start_point[0]) * eased,
+                start_point[1] + (end_point[1] - start_point[1]) * eased,
+            )
+
+        def _transition_rect(prev_row, next_row, from_slot, to_slot, move_start, move_end):
+            if move_end <= move_start:
+                return _vehicle_rect_from_slot(to_slot)
+            ratio = (current - move_start) / (move_end - move_start)
+            ratio = max(0.0, min(1.0, ratio))
+            from_rect = _vehicle_rect_from_slot(from_slot)
+            to_rect = _vehicle_rect_from_slot(to_slot)
+            rect_w = from_rect["w"]
+            rect_h = from_rect["h"]
+
+            from_center = (
+                from_rect["x"] + from_rect["w"] / 2,
+                from_rect["y"] + from_rect["h"] / 2,
+            )
+            to_center = (
+                to_rect["x"] + to_rect["w"] / 2,
+                to_rect["y"] + to_rect["h"] / 2,
+            )
+
+            prev_layout = station_layout.get(self._sim_row_station(prev_row), {})
+            next_layout = station_layout.get(self._sim_row_station(next_row), {})
+            moving_right = to_center[0] >= from_center[0]
+            if moving_right:
+                prev_exit_x = float(prev_layout.get("x", from_slot["x"])) + station_w + 6
+                next_entry_x = float(next_layout.get("x", to_slot["x"])) - 6
+            else:
+                prev_exit_x = float(prev_layout.get("x", from_slot["x"])) - 6
+                next_entry_x = float(next_layout.get("x", to_slot["x"])) + station_w + 6
+
+            prev_exit = (prev_exit_x, from_center[1])
+            next_entry = (next_entry_x, to_center[1])
+
+            if ratio < 0.25:
+                center = _lerp_point(from_center, prev_exit, ratio / 0.25)
+            elif ratio < 0.75:
+                center = _lerp_point(prev_exit, next_entry, (ratio - 0.25) / 0.50)
+            else:
+                center = _lerp_point(next_entry, to_center, (ratio - 0.75) / 0.25)
+
+            return {
+                "x": center[0] - rect_w / 2,
+                "y": center[1] - rect_h / 2,
+                "w": rect_w,
+                "h": rect_h,
+            }
+
         current = float(getattr(self, "sim_time", 0.0) or 0.0)
         target_takt = float(self.spn_target_takt.value()) if hasattr(self, "spn_target_takt") else 0.0
         vehicle_blocks = []
+        visual_move_window = 2.0
+        car_rows = self._sim_car_rows()
+        transition_car_keys = set()
+
+        for car_key, car_segments in car_rows.items():
+            if not car_segments:
+                continue
+            for idx in range(1, len(car_segments)):
+                prev_seg = car_segments[idx - 1]
+                next_seg = car_segments[idx]
+                next_start = self._sim_row_start(next_seg)
+                prev_finish = self._sim_row_service_finish(prev_seg)
+                if next_start < prev_finish:
+                    continue
+                if next_start <= current < next_start + visual_move_window:
+                    from_slot, _ = _slot_for_row(prev_seg)
+                    to_slot, _ = _slot_for_row(next_seg)
+                    if not from_slot or not to_slot:
+                        continue
+                    transition_car_keys.add(car_key)
+                    vehicle_blocks.append({
+                        "station": self._sim_row_station(next_seg),
+                        "line": _line_key(self._sim_row_line_no(next_seg)),
+                        "row": next_seg,
+                        "status": "移动",
+                        "seconds": f"剩余{max(0.0, next_start + visual_move_window - current):.1f}s",
+                        "over_takt": False,
+                        "order_time": next_start,
+                        "display_rect": _transition_rect(
+                            prev_seg,
+                            next_seg,
+                            from_slot,
+                            to_slot,
+                            next_start,
+                            next_start + visual_move_window,
+                        ),
+                    })
+                    break
 
         for row in rows:
+            if self._sim_car_key(row) in transition_car_keys:
+                continue
             start = self._sim_row_start(row)
             svc_finish = self._sim_row_service_finish(row)
             if start <= current < svc_finish:
@@ -2808,8 +3074,9 @@ class ExportTicketWindow(QMainWindow):
                     "order_time": start,
                 })
 
-        car_rows = self._sim_car_rows()
-        for _, car_segments in car_rows.items():
+        for car_key, car_segments in car_rows.items():
+            if car_key in transition_car_keys:
+                continue
             if not car_segments:
                 continue
             for idx, seg in enumerate(car_segments):
@@ -2832,7 +3099,7 @@ class ExportTicketWindow(QMainWindow):
         for item in sorted(vehicle_blocks, key=lambda value: value["order_time"]):
             if station_modes.get(item["station"]) != "shared":
                 continue
-            if item["status"] == "等待":
+            if item["status"] in ("等待", "移动"):
                 continue
             station_name = item["station"]
             if station_name not in shared_processing:
@@ -2849,7 +3116,11 @@ class ExportTicketWindow(QMainWindow):
 
         vehicle_blocks.sort(key=_vehicle_sort_key)
         slot_groups = {}
+        moving_blocks = []
         for item in vehicle_blocks:
+            if item.get("display_rect"):
+                moving_blocks.append(item)
+                continue
             station_slots = slot_rects.get(item["station"])
             if not station_slots:
                 continue
@@ -2878,14 +3149,16 @@ class ExportTicketWindow(QMainWindow):
                 continue
             main_item = items[0]
             overflow_count = max(0, len(items) - 1)
-            block_w = slot["w"] - 8
+            block_w = None
             if overflow_count:
-                block_w = max(82, block_w - 58)
+                block_w = max(54, min(slot["w"] - 66, 64 if compact_mode else 72))
+            rect = _vehicle_rect_from_slot(slot, block_w)
+            _draw_slot_status_label(slot, main_item["status"], main_item["seconds"])
             _draw_vehicle_capsule(
-                slot["x"] + 4,
-                slot["y"] + 3,
-                block_w,
-                slot["h"] - 6,
+                rect["x"],
+                rect["y"],
+                rect["w"],
+                rect["h"],
                 main_item["row"],
                 main_item["status"],
                 main_item["seconds"],
@@ -2897,5 +3170,18 @@ class ExportTicketWindow(QMainWindow):
                     slot["y"] + max(4, (slot["h"] - 18) / 2),
                     overflow_count,
                 )
+
+        for item in moving_blocks:
+            rect = item["display_rect"]
+            _draw_vehicle_capsule(
+                rect["x"],
+                rect["y"],
+                rect["w"],
+                rect["h"],
+                item["row"],
+                item["status"],
+                item["seconds"],
+                item.get("over_takt", False),
+            )
 
         self.sim_scene.setSceneRect(0, 0, scene_w, scene_h)
