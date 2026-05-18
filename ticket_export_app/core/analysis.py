@@ -139,6 +139,54 @@ def _compute_car_finish_times(rows: Iterable[Dict[str, Any]]) -> Dict[int, float
     return finish_by_car
 
 
+def _planned_fill_car_key(row: Dict[str, Any]) -> int:
+    for key in ("car", "car_no", "car_index", "idx"):
+        car = _to_int(row.get(key, 0), 0)
+        if car > 0:
+            return car
+    return 0
+
+
+def _planned_fill_row_duration(row: Dict[str, Any]) -> float:
+    duration = _to_float(row.get("dur", row.get("duration", 0.0)), 0.0)
+    if duration > 0:
+        return duration
+
+    start = _to_float(row.get("start", row.get("start_time", row.get("begin", 0.0))), 0.0)
+    for key in ("svc_finish", "finish", "end"):
+        finish = _to_float(row.get(key, 0.0), 0.0)
+        if finish > start:
+            return max(0.0, finish - start)
+    return 0.0
+
+
+def _compute_planned_fill_time_from_rows(rows: Iterable[Dict[str, Any]]) -> float:
+    """首台车经过所有有效工位的标准加工时间合计，不包含等待。"""
+    rows = list(rows or [])
+    first_car = 0
+    for row in rows:
+        car = _planned_fill_car_key(row)
+        if car <= 0:
+            continue
+        first_car = car if first_car <= 0 else min(first_car, car)
+
+    if first_car <= 0:
+        return 0.0
+
+    first_car_rows = [
+        row for row in rows
+        if _planned_fill_car_key(row) == first_car
+    ]
+    first_car_rows.sort(
+        key=lambda item: (
+            _to_int(item.get("step_seq", item.get("seq", 0)), 0),
+            _to_float(item.get("start", item.get("start_time", item.get("begin", 0.0))), 0.0),
+        )
+    )
+
+    return sum(_planned_fill_row_duration(row) for row in first_car_rows)
+
+
 def _compute_wait_summary(rows: List[Dict[str, Any]], target_takt: float) -> Dict[str, Any]:
     """
     等待统计。
@@ -637,7 +685,10 @@ def apply_time_window_analysis(
     )
 
     station_count = max(1, len(station_names))
-    line_lead_time = station_count * target_takt
+    planned_fill_time = _compute_planned_fill_time_from_rows(rows or [])
+    if planned_fill_time <= 0:
+        planned_fill_time = station_count * target_takt
+    line_lead_time = planned_fill_time
     if analysis_time_seconds + 1e-9 < line_lead_time:
         planned_output_count = 0
     else:
@@ -686,6 +737,7 @@ def apply_time_window_analysis(
         "theoretical_launch_count": theoretical_launch_count,
         "station_count": station_count,
         "line_lead_time": line_lead_time,
+        "planned_fill_time": planned_fill_time,
         "planned_output_count_in_window": planned_output_count,
         "actual_output_count_in_window": actual_output_count,
         "display_actual_output_count_in_window": display_actual_output_count,
