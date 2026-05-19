@@ -30,7 +30,7 @@ from core.input_parser import parse_multi_project_inputs as core_parse_multi_pro
 
 class ExportTicketWindow(QMainWindow):
     """
-    导出组合票（独立于数据校对）
+    M-Line 混流节拍仿真系统（独立于数据校对）
     v2 岗位矩阵字段：
       序号 / 工程名称 / 设备数量 / 所属线别 / 岗位设备 / A工时 / B工时 / C工时
     说明：
@@ -44,7 +44,7 @@ class ExportTicketWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"导出组合票  v{__version__}")
+        self.setWindowTitle("M-Line 混流节拍仿真系统 v2.9")
         self.resize(1180, 760)
         self.setMinimumSize(1080, 700)
 
@@ -389,8 +389,21 @@ class ExportTicketWindow(QMainWindow):
         self.sim_progress.setMaximumHeight(18)
         self.sim_progress.setFormat("进度 %p%")
         sim_control_row.addWidget(self.sim_progress)
+        self.lbl_realtime_takt = QLabel("实时节拍：-")
+        self.lbl_realtime_takt.setStyleSheet(
+            "QLabel {"
+            "font-size: 12px;"
+            "font-weight: 700;"
+            "color: #334155;"
+            "background: #f8fafc;"
+            "border: 1px solid #dbe3ef;"
+            "border-radius: 5px;"
+            "padding: 3px 8px;"
+            "}"
+        )
+        sim_control_row.addWidget(self.lbl_realtime_takt)
         self.cmb_sim_speed = QComboBox()
-        self.cmb_sim_speed.addItems(["1x", "5x", "10x", "50x"])
+        self.cmb_sim_speed.addItems(["1x", "5x", "10x", "20x", "30x", "40x", "50x", "60x", "80x", "100x"])
         self.cmb_sim_speed.setCurrentText("10x")
         self.btn_sim_play = QPushButton("播放")
         self.btn_sim_pause = QPushButton("暂停")
@@ -645,6 +658,7 @@ class ExportTicketWindow(QMainWindow):
             self._update_sim_view()
             self._draw_sim_scene()
             self._show_analysis_result(analysis)
+            self._update_realtime_model_result()
             self.status.showMessage("排程分析完成", 6000)
         except Exception as e:
             import traceback
@@ -703,6 +717,7 @@ class ExportTicketWindow(QMainWindow):
         self._update_sim_time_label()
         self._update_sim_view()
         self._draw_sim_scene()
+        self._update_realtime_model_result()
 
     def _fmt_vehicle_log_value(self, value):
         if value is None:
@@ -845,6 +860,7 @@ class ExportTicketWindow(QMainWindow):
         self._update_sim_time_label()
         self._update_sim_view()
         self._draw_sim_scene()
+        self._update_realtime_model_result()
         if self.sim_time >= total:
             self._pause_simulation()
 
@@ -976,6 +992,73 @@ class ExportTicketWindow(QMainWindow):
         """统一生成等待文案；安全模式下默认只显示等待时长。"""
         wait_remain = max(0.0, wait_end - current)
         return f"等待{wait_remain:.1f}s"
+
+    def _build_realtime_blocking_hint(self, current_time: float) -> str:
+        """按已发生 block_wait 汇总实时阻塞工程，根因优先归属下一有效工程。"""
+        try:
+            current = float(current_time or 0.0)
+        except Exception:
+            current = 0.0
+
+        blocking_by_station = {}
+        for _, car_segments in self._sim_car_rows().items():
+            if not car_segments:
+                continue
+            ordered = sorted(
+                car_segments,
+                key=lambda row: (
+                    self._sim_row_start(row),
+                    self._sim_row_depart(row),
+                    self._sim_row_station(row),
+                ),
+            )
+            for idx, row in enumerate(ordered):
+                block_wait = self._sim_row_block_wait(row)
+                if block_wait <= 0:
+                    continue
+
+                wait_start = self._sim_row_service_finish(row)
+                wait_end = self._sim_row_depart(row)
+                next_row = ordered[idx + 1] if idx + 1 < len(ordered) else None
+                if next_row is not None:
+                    wait_end = max(wait_end, self._sim_row_start(next_row))
+
+                if current <= wait_start:
+                    occurred = 0.0
+                elif current < wait_end:
+                    occurred = min(block_wait, max(0.0, current - wait_start))
+                else:
+                    occurred = block_wait
+
+                if occurred <= 0:
+                    continue
+
+                blocking_station = self._sim_row_station(next_row) if next_row is not None else self._sim_row_station(row)
+                blocking_by_station[blocking_station] = blocking_by_station.get(blocking_station, 0.0) + occurred
+
+        if not blocking_by_station:
+            return "阻塞工程：无"
+
+        def _fmt_seconds(value):
+            try:
+                seconds = float(value or 0.0)
+            except Exception:
+                seconds = 0.0
+            if seconds >= 10 or abs(seconds - round(seconds)) < 1e-9:
+                return f"{int(round(seconds))}s"
+            return f"{seconds:.1f}s"
+
+        sorted_items = sorted(
+            blocking_by_station.items(),
+            key=lambda item: float(item[1]),
+            reverse=True,
+        )
+        parts = [
+            f"{station} {_fmt_seconds(seconds)}"
+            for station, seconds in sorted_items[:2]
+        ]
+        suffix = " 等" if len(sorted_items) > 2 else ""
+        return f"阻塞工程：{'，'.join(parts)}{suffix}"
 
     def _build_schedule_debug_log(self, rows, limit: int = 200) -> str:
         """按车辆维度输出一车一行的排程流转日志。"""
@@ -1290,29 +1373,7 @@ class ExportTicketWindow(QMainWindow):
             waiting_lines.append("无")
         waiting_lines = _compress_lines(waiting_lines, 2)
 
-        analysis = getattr(self, "last_analysis", None)
-        summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
-        model_hint_text = str(
-            summary.get("process_over_takt_root_text")
-            or summary.get("process_root_text")
-            or "无"
-        ).strip() or "无"
-        if model_hint_text != "无":
-            normalized_blocking = (
-                model_hint_text.replace("、", "，")
-                .replace(",", "，")
-                .replace("；", "，")
-                .replace(";", "，")
-            )
-            blocking_parts = [
-                part.strip() for part in normalized_blocking.split("，") if part.strip()
-            ]
-            if len(blocking_parts) > 2:
-                model_hint_text = f"超节拍工程：{'，'.join(blocking_parts[:2])} 等"
-            elif blocking_parts:
-                model_hint_text = f"超节拍工程：{'，'.join(blocking_parts)}"
-        else:
-            model_hint_text = "详见模型结果"
+        model_hint_text = self._build_realtime_blocking_hint(current)
         blocking_lines = _compress_lines(model_hint_text.splitlines() or [model_hint_text], 2)
 
         active_html = _slot_html(active_lines)
@@ -2154,14 +2215,11 @@ class ExportTicketWindow(QMainWindow):
         over_count = summary.get("over_takt_station_count", 0)
         process_root_text = summary.get("process_over_takt_root_text", "无") or "无"
         batch_overrun_raw = float(summary.get("batch_overrun_time", 0.0) or 0.0)
-        final_result = "NG" if batch_overrun_raw > 0 else "OK"
-
         text = (
             "结果分析："
-            f"模型最终判定 {final_result} ｜ "
             f"累计阻塞 {blocking_time} 秒 ｜ "
             f"溢出工时 {batch_overrun_time} 秒 / {batch_overrun_cars} 台 ｜ "
-            f"超节拍工程 {process_root_text}"
+            f"阻塞工程 {blocking_station_text}"
         )
 
 
@@ -2233,6 +2291,255 @@ class ExportTicketWindow(QMainWindow):
 
         # 固定列宽，不再自动根据内容调整，避免每次分析后表格宽度跳动
         # self.tbl_station_analysis.resizeColumnsToContents()
+
+    def _build_realtime_model_result(self, current_time: float) -> dict:
+        rows = getattr(self, "last_schedule_rows", []) or []
+        try:
+            current = float(current_time or 0.0)
+        except Exception:
+            current = 0.0
+
+        try:
+            target_takt = float(self.spn_target_takt.value()) if hasattr(self, "spn_target_takt") else 0.0
+        except Exception:
+            target_takt = 0.0
+
+        car_rows = self._sim_car_rows()
+
+        def _car_sort_key(car_key):
+            try:
+                return (0, int(float(car_key)))
+            except Exception:
+                return (1, str(car_key))
+
+        analysis = getattr(self, "last_analysis", None)
+        summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
+        is_ratio_mode = False
+        if hasattr(self, "cmb_launch_mode"):
+            is_ratio_mode = self.cmb_launch_mode.currentIndex() == 1
+        else:
+            is_ratio_mode = bool(summary.get("analysis_time_seconds"))
+
+        analysis_time_seconds = 0.0
+        if is_ratio_mode:
+            try:
+                analysis_time_seconds = float(summary.get("analysis_time_seconds", 0.0) or 0.0)
+            except Exception:
+                analysis_time_seconds = 0.0
+            if analysis_time_seconds <= 0:
+                try:
+                    analysis_time_seconds = float(getattr(self, "current_analysis_time_seconds", 0.0) or 0.0)
+                except Exception:
+                    analysis_time_seconds = 0.0
+            if analysis_time_seconds <= 0 and hasattr(self, "spn_total_cars"):
+                try:
+                    analysis_time_seconds = float(self.spn_total_cars.value()) * 60.0
+                except Exception:
+                    analysis_time_seconds = 0.0
+
+        current_finished = []
+        all_vehicles = []
+        for car_key, segments in car_rows.items():
+            if not segments:
+                continue
+            ordered = sorted(segments, key=lambda row: (self._sim_row_start(row), self._sim_row_depart(row)))
+            car_in = self._sim_row_start(ordered[0])
+            car_out = self._sim_row_depart(ordered[-1])
+            car_type = str(
+                self._sim_row_value(ordered[0], "car_type", "type", "vehicle_type", default="")
+                or ""
+            ).strip().upper()
+            all_vehicles.append({
+                "car_key": car_key,
+                "car_type": car_type,
+                "car_in": car_in,
+                "car_out": car_out,
+                "flow": max(0.0, car_out - car_in),
+                "station_count": max(1, len(ordered)),
+                "segments": ordered,
+            })
+            if car_out <= current + 1e-9:
+                current_finished.append({
+                    "car_key": car_key,
+                    "car_type": car_type,
+                    "car_in": car_in,
+                    "car_out": car_out,
+                    "flow": max(0.0, car_out - car_in),
+                    "station_count": max(1, len(ordered)),
+                    "segments": ordered,
+                })
+
+        all_vehicles.sort(key=lambda item: (item["car_out"], _car_sort_key(item["car_key"])))
+        current_finished.sort(key=lambda item: (item["car_out"], _car_sort_key(item["car_key"])))
+        if is_ratio_mode and analysis_time_seconds > 0:
+            target_scope_vehicles = [
+                item for item in all_vehicles
+                if item["car_out"] <= analysis_time_seconds + 1e-9
+            ]
+        else:
+            target_scope_vehicles = list(all_vehicles)
+        denominator_vehicle_count = len(target_scope_vehicles)
+        if denominator_vehicle_count <= 0:
+            target_scope_vehicles = list(all_vehicles)
+            denominator_vehicle_count = len(target_scope_vehicles)
+        output_vehicle_count = denominator_vehicle_count
+
+        def _recent_out_interval_takt(vehicles):
+            if len(vehicles) < 2:
+                return None
+            recent = vehicles[-6:]
+            gaps = [
+                recent[idx]["car_out"] - recent[idx - 1]["car_out"]
+                for idx in range(1, len(recent))
+            ]
+            gaps = [gap for gap in gaps if gap >= 0]
+            if not gaps:
+                return None
+            return sum(gaps) / len(gaps)
+
+        realtime_takt = _recent_out_interval_takt(current_finished)
+        if denominator_vehicle_count >= 2:
+            overall_takt = (
+                target_scope_vehicles[-1]["car_out"] - target_scope_vehicles[0]["car_out"]
+            ) / (denominator_vehicle_count - 1)
+        else:
+            overall_takt = None
+
+        def _row_duration(row: dict) -> float:
+            value = self._sim_row_value(row, "dur", "duration", "work_time", "process_time", default=None)
+            if value is not None:
+                try:
+                    return max(0.0, float(value or 0.0))
+                except Exception:
+                    pass
+            start = self._sim_row_start(row)
+            finish = self._sim_row_service_finish(row)
+            return max(0.0, finish - start)
+
+        def _effective_capacity(row: dict) -> float:
+            value = self._sim_row_value(row, "capacity", default=None)
+            if value is not None:
+                try:
+                    return max(1.0, float(value or 1.0))
+                except Exception:
+                    pass
+            run_mode = str(self._sim_row_value(row, "run_mode", default="") or "")
+            if run_mode == "双线双设备":
+                return 2.0
+            if run_mode in ("单线单设备", "双线单设备"):
+                return 1.0
+            line_scope = str(self._sim_row_value(row, "line_scope", default="") or "")
+            device_count = self._sim_row_value(row, "device_count", default=None)
+            try:
+                device_value = int(float(device_count or 1))
+            except Exception:
+                device_value = 1
+            if device_value >= 2 and line_scope == "双线":
+                return 2.0
+            return 1.0
+
+        qualified_vehicle_count = 0
+        capacity_over_station_map = {}
+        if denominator_vehicle_count > 0 and target_takt > 0:
+            for item in target_scope_vehicles:
+                vehicle_ok = True
+                car_type = str(item.get("car_type") or "").upper()
+                for row in item.get("segments", []):
+                    duration = _row_duration(row)
+                    if duration <= 0:
+                        continue
+                    capacity = _effective_capacity(row)
+                    station_capacity_takt = duration / capacity
+                    if station_capacity_takt <= target_takt:
+                        continue
+                    vehicle_ok = False
+                    station_name = self._sim_row_station(row)
+                    rec = capacity_over_station_map.setdefault(station_name, {
+                        "station": station_name,
+                        "vehicle_count": 0,
+                        "by_type": {"A": 0, "B": 0, "C": 0},
+                        "max_over": 0.0,
+                    })
+                    rec["vehicle_count"] += 1
+                    if car_type in rec["by_type"]:
+                        rec["by_type"][car_type] += 1
+                    rec["max_over"] = max(rec["max_over"], station_capacity_takt - target_takt)
+                if vehicle_ok:
+                    qualified_vehicle_count += 1
+        capacity_over_stations = sorted(
+            capacity_over_station_map.values(),
+            key=lambda item: (-int(item.get("vehicle_count", 0) or 0), str(item.get("station", ""))),
+        )
+        over_takt_vehicle_count = denominator_vehicle_count - qualified_vehicle_count if target_takt > 0 else 0
+
+        if target_takt <= 0 or denominator_vehicle_count <= 0 or overall_takt is None:
+            result = "未判定"
+            qualified_rate = None
+        else:
+            qualified_rate = qualified_vehicle_count / denominator_vehicle_count
+            if (
+                qualified_vehicle_count == denominator_vehicle_count
+                and qualified_rate == 1.0
+                and overall_takt <= target_takt
+            ):
+                result = "OK"
+            else:
+                result = "NG"
+
+        blocking_time = current
+        if is_ratio_mode and analysis_time_seconds > 0:
+            blocking_time = analysis_time_seconds
+        elif all_vehicles:
+            blocking_time = all_vehicles[-1]["car_out"]
+
+        total_blocking_so_far = 0.0
+        for row in rows:
+            block_wait = self._sim_row_block_wait(row)
+            if block_wait <= 0:
+                continue
+            svc_finish = self._sim_row_service_finish(row)
+            depart = self._sim_row_depart(row)
+            if blocking_time <= svc_finish:
+                continue
+            if blocking_time < depart:
+                total_blocking_so_far += min(max(0.0, blocking_time - svc_finish), block_wait)
+            else:
+                total_blocking_so_far += block_wait
+        blocking_hint = self._build_realtime_blocking_hint(blocking_time)
+
+        return {
+            "result": result,
+            "output_vehicle_count": output_vehicle_count,
+            "qualified_vehicle_count": qualified_vehicle_count,
+            "denominator_vehicle_count": denominator_vehicle_count,
+            "qualified_rate": qualified_rate,
+            "over_takt_vehicle_count": over_takt_vehicle_count,
+            "capacity_over_stations": capacity_over_stations,
+            "realtime_takt": realtime_takt,
+            "overall_takt": overall_takt,
+            "target_takt": target_takt,
+            "total_blocking_so_far": total_blocking_so_far,
+            "blocking_hint": blocking_hint,
+            "current_time": current,
+        }
+
+    def _update_realtime_model_result(self):
+        if not getattr(self, "last_schedule_rows", None):
+            if hasattr(self, "lbl_realtime_takt"):
+                self.lbl_realtime_takt.setText("实时节拍：-")
+            return
+        realtime = self._build_realtime_model_result(float(getattr(self, "sim_time", 0.0) or 0.0))
+        if hasattr(self, "lbl_realtime_takt"):
+            realtime_takt = realtime.get("realtime_takt")
+            target_takt = self._fmt_analysis_num(realtime.get("target_takt", 0.0))
+            if realtime_takt is None:
+                self.lbl_realtime_takt.setText("实时节拍：-")
+            else:
+                self.lbl_realtime_takt.setText(f"实时节拍：{self._fmt_analysis_num(realtime_takt)}/{target_takt}")
+        analysis = getattr(self, "last_analysis", None)
+        if isinstance(analysis, dict):
+            self._show_vehicle_summary(analysis)
+
     def _show_vehicle_summary(self, analysis):
         """在车型数据摘要区展示当前排程的车型构成与关键结果。"""
         if not hasattr(self, "lbl_vehicle_summary"):
@@ -2369,108 +2676,64 @@ class ExportTicketWindow(QMainWindow):
             + "<br>".join(_summary_line(line) for line in summary_lines)
             + "</div>"
         )
-        if is_ratio and time_window_result:
-            if str(final_result).upper() == "OK":
-                final_color = "#16a34a"
-            elif str(final_result).upper() == "NG":
-                final_color = "#dc2626"
-            else:
-                final_color = "#0f172a"
-
-            if finish_delta_num is None:
-                finish_delta_color = "#0f172a"
-                remark_delta = "差异—"
-            elif finish_delta_num > 0:
-                finish_delta_color = "#dc2626"
-                remark_delta = f"超时{self._fmt_analysis_num(abs(finish_delta_num))}s"
-            elif finish_delta_num < 0:
-                finish_delta_color = "#16a34a"
-                remark_delta = f"富余{self._fmt_analysis_num(abs(finish_delta_num))}s"
-            else:
-                finish_delta_color = "#0f172a"
-                remark_delta = "准时0s"
-
-            remark_color = finish_delta_color
-            model_cards = [
-                _metric_card("最终判定", final_result, final_color),
-                _metric_card("下线台数", f"{display_actual_output_count}/{planned_output_count}"),
-                _metric_card("达成率", f"{achievement_rate:.1f}%"),
-                _metric_card("实际节拍", f"{actual_line_takt_in_window}/{target_takt_display}"),
-                _metric_card("累计阻塞", f"{blocking_time}s"),
+        realtime = self._build_realtime_model_result(float(getattr(self, "sim_time", 0.0) or 0.0))
+        output_vehicle_count = int(realtime.get("output_vehicle_count", 0) or 0)
+        qualified_vehicle_count = int(realtime.get("qualified_vehicle_count", 0) or 0)
+        denominator_vehicle_count = int(realtime.get("denominator_vehicle_count", output_vehicle_count) or 0)
+        qualified_rate = realtime.get("qualified_rate")
+        qualified_rate_text = "—" if qualified_rate is None else f"{float(qualified_rate) * 100:.1f}%"
+        target_takt_value = realtime.get("target_takt", summary.get("target_takt", 0.0))
+        target_takt_text = self._fmt_analysis_num(target_takt_value)
+        overall_takt = realtime.get("overall_takt")
+        overall_takt_text = "—" if overall_takt is None else self._fmt_analysis_num(overall_takt)
+        blocking_so_far = self._fmt_analysis_num(realtime.get("total_blocking_so_far", 0.0))
+        current_time = self._fmt_analysis_num(realtime.get("current_time", 0.0))
+        risk_parts = []
+        capacity_over_stations = realtime.get("capacity_over_stations", []) or []
+        if capacity_over_stations:
+            station_parts = [
+                str(item.get("station", "") or "岗位")
+                for item in capacity_over_stations[:2]
             ]
-            right_html = (
-                "<div style='font-size:13px;font-weight:700;color:#334155;margin-bottom:4px;'>模型结果</div>"
-                "<div style='margin-bottom:2px;'>"
-                "<table width='100%' cellspacing='2' cellpadding='0' style='width:100%;'>"
-                "<tr>"
-                + "".join(model_cards)
-                + "</tr></table>"
-                "</div>"
-                f"<div style='font-size:11px;color:#334155;line-height:1.3;margin-top:2px;margin-bottom:0;'>超节拍工程：{process_root_text}｜备注：计划{planned_n_finish_time}s完成｜实际{actual_n_finish_time}s完成｜"
-                f"<span style='color:{remark_color};font-weight:700;'>{remark_delta}</span></div>"
-            )
-        else:
-            try:
-                target_takt_raw = float(summary.get(
-                    "target_takt",
-                    self.spn_target_takt.value() if hasattr(self, "spn_target_takt") else 0.0
-                ) or 0.0)
-            except Exception:
-                target_takt_raw = 0.0
+            station_text = "、".join(station_parts)
+            if len(capacity_over_stations) > 2:
+                station_text += " 等"
+            risk_parts.append(f"工位能力超节拍：{station_text}")
+        blocking_hint = str(realtime.get("blocking_hint", "") or "")
+        if blocking_hint and blocking_hint != "阻塞工程：无":
+            risk_parts.append(blocking_hint)
+        try:
+            overall_takt_value = float(overall_takt) if overall_takt is not None else None
+            target_takt_float = float(target_takt_value or 0.0)
+        except Exception:
+            overall_takt_value = None
+            target_takt_float = 0.0
+        if overall_takt_value is not None and target_takt_float > 0 and overall_takt_value > target_takt_float:
+            risk_parts.append(f"整体节拍 {overall_takt_text}/{target_takt_text}")
+        risk_hint_text = "｜".join(risk_parts) if risk_parts else "暂无明显风险"
 
-            try:
-                max_finish_raw = float(summary.get("max_finish", 0.0) or 0.0)
-            except Exception:
-                max_finish_raw = 0.0
-
-            try:
-                total_wait_raw = float(summary.get("total_wait", 0.0) or 0.0)
-            except Exception:
-                total_wait_raw = 0.0
-
-            station_count = 0
-            try:
-                station_count = len(self._sim_station_names())
-            except Exception:
-                station_count = 0
-
-            if station_count <= 0:
-                station_stats = analysis.get("station_stats", []) if isinstance(analysis, dict) else []
-                station_count = len(station_stats)
-
-            station_count = max(1, station_count)
-
-            if target_takt_raw > 0 and total_cars > 0:
-                planned_finish_raw = (total_cars + station_count - 1) * target_takt_raw
-            else:
-                planned_finish_raw = 0.0
-
-            planned_finish = self._fmt_analysis_num(planned_finish_raw)
-
-            has_over_takt_root = process_root_text not in ("无", "", "—")
-            has_finish_gap = planned_finish_raw > 0 and max_finish_raw > planned_finish_raw + 1e-6
-            has_blocking = total_wait_raw > 0
-
-            quantity_final_result = "NG" if (has_finish_gap or has_blocking or has_over_takt_root) else "OK"
-            quantity_final_color = "#dc2626" if quantity_final_result == "NG" else "#16a34a"
-
-            model_cards = [
-                _metric_card("最终判定", quantity_final_result, quantity_final_color),
-                _metric_card("生成台数", f"{total_cars}台"),
-                _metric_card("完成时间", f"{max_finish}s"),
-                _metric_card("计划时间", f"{planned_finish}s"),
-                _metric_card("累计阻塞", f"{blocking_time}s"),
-            ]
-            right_html = (
-                "<div style='font-size:13px;font-weight:700;color:#334155;margin-bottom:4px;'>模型结果</div>"
-                "<div style='margin-bottom:2px;'>"
-                "<table width='100%' cellspacing='2' cellpadding='0' style='width:100%;'>"
-                "<tr>"
-                + "".join(model_cards)
-                + "</tr></table>"
-                "</div>"
-                f"<div style='font-size:11px;color:#334155;line-height:1.3;margin-top:2px;margin-bottom:0;'>超节拍工程：{process_root_text}</div>"
-            )
+        model_cards = [
+            _metric_card("下线车辆", f"{output_vehicle_count}台"),
+            _metric_card("达标车辆", f"{qualified_vehicle_count}/{denominator_vehicle_count}"),
+            _metric_card("达标率", qualified_rate_text),
+            _metric_card("整体节拍", f"{overall_takt_text}/{target_takt_text}"),
+            _metric_card("累计阻塞", f"{blocking_so_far}s"),
+        ]
+        right_html = (
+            "<div style='font-size:13px;font-weight:700;color:#334155;margin-bottom:4px;'>模型结果</div>"
+            "<div style='margin-bottom:2px;'>"
+            "<table width='100%' cellspacing='2' cellpadding='0' style='width:100%;'>"
+            "<tr>"
+            + "".join(model_cards)
+            + "</tr></table>"
+            "</div>"
+            f"<div style='font-size:11px;color:#334155;line-height:1.3;margin-top:2px;margin-bottom:0;'>"
+            f"当前仿真时间 {current_time}s｜统计口径：整体节拍=统计对象全部OUT间隔平均；实时节拍见仿真栏"
+            "</div>"
+            f"<div style='font-size:12px;color:#334155;line-height:1.4;margin-top:3px;'>"
+            f"<span style='font-weight:700;color:#0f172a;'>风险提示：</span>{risk_hint_text}"
+            "</div>"
+        )
         
         html = (
             "<table width='100%' cellspacing='0' cellpadding='0'>"
@@ -2786,8 +3049,6 @@ class ExportTicketWindow(QMainWindow):
         def _slot_status_text(status, seconds_text):
             if status == "移动":
                 return ""
-            if status == "超时":
-                return seconds_text if str(seconds_text).startswith("超时") else f"超时 {seconds_text}"
             if status == "等待":
                 return seconds_text if str(seconds_text).startswith("等待") else f"等待 {seconds_text}"
             return f"{status} {seconds_text}".strip()
@@ -2796,10 +3057,8 @@ class ExportTicketWindow(QMainWindow):
             label_text = _slot_status_text(status, seconds_text)
             if not label_text:
                 return
-            if status == "超时":
+            if status == "等待":
                 color = QColor("#ef4444")
-            elif status == "等待":
-                color = QColor("#fb923c")
             else:
                 color = QColor("#22c55e")
             label_item = self.sim_scene.addText(label_text)
@@ -2818,12 +3077,9 @@ class ExportTicketWindow(QMainWindow):
                 self._sim_row_value(row, "car_type", "type", "vehicle_type", default="")
                 or ""
             ).upper()
-            if over_takt:
+            if status == "等待":
                 border = QColor("#dc2626")
                 fill = QColor("#fee2e2")
-            elif status == "等待":
-                border = QColor("#f97316")
-                fill = QColor("#ffedd5")
             elif status == "移动":
                 border = QColor("#38bdf8")
                 fill = QColor("#e0f2fe")
@@ -3015,7 +3271,6 @@ class ExportTicketWindow(QMainWindow):
             }
 
         current = float(getattr(self, "sim_time", 0.0) or 0.0)
-        target_takt = float(self.spn_target_takt.value()) if hasattr(self, "spn_target_takt") else 0.0
         vehicle_blocks = []
         visual_move_window = 2.0
         car_rows = self._sim_car_rows()
@@ -3062,15 +3317,14 @@ class ExportTicketWindow(QMainWindow):
             start = self._sim_row_start(row)
             svc_finish = self._sim_row_service_finish(row)
             if start <= current < svc_finish:
-                elapsed = max(0.0, current - start)
                 remain = max(0.0, svc_finish - current)
                 vehicle_blocks.append({
                     "station": self._sim_row_station(row),
                     "line": _line_key(self._sim_row_line_no(row)),
                     "row": row,
-                    "status": "超时" if target_takt > 0 and elapsed > target_takt else "加工",
-                    "seconds": f"超时{elapsed - target_takt:.1f}s" if target_takt > 0 and elapsed > target_takt else f"剩余{remain:.1f}s",
-                    "over_takt": target_takt > 0 and elapsed > target_takt,
+                    "status": "加工",
+                    "seconds": f"剩余{remain:.1f}s",
+                    "over_takt": False,
                     "order_time": start,
                 })
 
